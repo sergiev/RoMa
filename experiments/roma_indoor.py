@@ -8,8 +8,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import json
-import wandb
-from tqdm import tqdm
 
 from romatch.benchmarks import MegadepthDenseBenchmark
 from romatch.datasets.megadepth import MegadepthBuilder
@@ -287,7 +285,7 @@ def test_scannet(model, name, resolution, sample_mode):
 if __name__ == "__main__":
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
-    warnings.filterwarnings('ignore')#, category=UserWarning)#, message='WARNING batched routines are designed for small sizes.')
+    warnings.filterwarnings('ignore', category=UserWarning, message='WARNING batched routines are designed for small sizes.*')
     os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1" # For BF16 computations
     os.environ["OMP_NUM_THREADS"] = "16"
     

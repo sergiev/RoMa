@@ -13,9 +13,6 @@ from torch.utils.data import ConcatDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import json
-import wandb
-from PIL import Image
-from torchvision.transforms import ToTensor
 
 from romatch.benchmarks import MegadepthDenseBenchmark, ScanNetBenchmark
 from romatch.benchmarks import Mega1500PoseLibBenchmark, ScanNetPoselibBenchmark
@@ -337,7 +334,7 @@ def train(args):
     wandb_log = not args.dont_log_wandb
     experiment_name = Path(__file__).stem
     wandb_mode = "online" if wandb_log and rank == 0 else "disabled"
-    wandb.init(project="romatch", entity=args.wandb_entity, name=experiment_name, reinit=False, mode = wandb_mode)
+    # wandb.init(project="romatch", entity=args.wandb_entity, name=experiment_name, reinit=False, mode = wandb_mode)
     checkpoint_dir = "workspace/checkpoints/"
     h,w = resolutions[resolution]
     model = XFeatModel(freeze_xfeat = False).to(device_id)
@@ -407,7 +404,7 @@ def train(args):
             n, k, mega_dataloader, model, depth_loss, optimizer, lr_scheduler, grad_scaler, grad_clip_norm = grad_clip_norm,
         )
         checkpointer.save(model, optimizer, lr_scheduler, romatch.GLOBAL_STEP)
-        wandb.log(mega1500_benchmark.benchmark(model, model_name=experiment_name), step = romatch.GLOBAL_STEP)
+        # wandb.log(mega1500_benchmark.benchmark(model, model_name=experiment_name), step = romatch.GLOBAL_STEP)
 
 def test_mega_8_scenes(model, name):
     mega_8_scenes_benchmark = MegaDepthPoseEstimationBenchmark("data/megadepth",

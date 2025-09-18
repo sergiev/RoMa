@@ -7,12 +7,13 @@ from torch.utils.data import ConcatDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import json
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 from romatch.benchmarks import MegadepthDenseBenchmark
-from romatch.datasets.megadepth import MegadepthBuilder
+from romatch.datasets.custom_dataset import CustomBuilder  # <-- 1. ИМПОРТ
 from romatch.losses.robust_loss import RobustLosses
-from romatch.benchmarks import MegaDepthPoseEstimationBenchmark, MegadepthDenseBenchmark, HpatchesHomogBenchmark
+from romatch.benchmarks import MegaDepthPoseEstimationBenchmark
+from romatch.benchmarks.custom_benchmark import UmbraBenchmark # <-- ИМПОРТ НОВОГО БЕНЧМАРКА
 
 from romatch.train.train import train_k_steps
 from romatch.models.matcher import *
@@ -20,7 +21,7 @@ from romatch.models.transformer import Block, TransformerDecoder, MemEffAttentio
 from romatch.models.encoders import *
 from romatch.checkpointing import CheckPoint
 
-resolutions = {"low":(448, 448), "medium":(14*8*5, 14*8*5), "high":(14*8*6, 14*8*6)}
+resolutions = {"low":(448, 448), "medium":(14*8*5, 14*8*5), "high":(14*8*6, 14*8*6), "mega": (14*8*9, 14*8*9)}
 
 def get_model(pretrained_backbone=True, resolution = "medium", **kwargs):
     import warnings
@@ -162,6 +163,7 @@ def get_model(pretrained_backbone=True, resolution = "medium", **kwargs):
             amp = True),
         amp = True,
         use_vgg = True,
+        in_chans = 1, # <--- Указываем 1 входной канал
     )
     matcher = RegressionMatcher(encoder, decoder, h=h, w=w,**kwargs)
     return matcher
@@ -178,10 +180,10 @@ def train(args):
     torch.cuda.set_device(device_id)
     
     resolution = args.train_resolution
-    wandb_log = not args.dont_log_wandb
     experiment_name = os.path.splitext(os.path.basename(__file__))[0]
-    wandb_mode = "online" if wandb_log and rank == 0 else "disabled"
-    wandb.init(project="romatch", entity=args.wandb_entity, name=experiment_name, reinit=False, mode = wandb_mode)
+    if rank == 0:
+        writer = SummaryWriter(f"workspace/runs/{experiment_name}")
+
     checkpoint_dir = "workspace/checkpoints/"
     h,w = resolutions[resolution]
     model = get_model(pretrained_backbone=True, resolution=resolution, attenuate_cert = False).to(device_id)
@@ -191,25 +193,22 @@ def train(args):
     step_size = gpus*batch_size
     romatch.STEP_SIZE = step_size
     
-    N = (32 * 250000)  # 250k steps of batch size 32
+    N = (batch_size * 25000)  # 250k steps of batch size
     # checkpoint every
-    k = 25000 // romatch.STEP_SIZE
+    k = 1000 // romatch.STEP_SIZE
 
-    # Data
-    mega = MegadepthBuilder(data_root="data/megadepth", loftr_ignore=True, imc21_ignore = True)
-    use_horizontal_flip_aug = True
-    rot_prob = 0
+
     depth_interpolation_mode = "bilinear"
-    megadepth_train1 = mega.build_scenes(
-        split="train_loftr", min_overlap=0.01, shake_t=32, use_horizontal_flip_aug = use_horizontal_flip_aug, rot_prob = rot_prob,
-        ht=h,wt=w,
-    )
-    megadepth_train2 = mega.build_scenes(
-        split="train_loftr", min_overlap=0.35, shake_t=32, use_horizontal_flip_aug = use_horizontal_flip_aug, rot_prob = rot_prob,
-        ht=h,wt=w,
-    )
-    megadepth_train = ConcatDataset(megadepth_train1 + megadepth_train2)
-    mega_ws = mega.weight_scenes(megadepth_train, alpha=0.75)
+
+    train_json_path = "/home/sema/radar/datasets/umbra_tiles/pairs_train.json"
+    train_builder = CustomBuilder(data_root=train_json_path)
+
+    # Убедитесь, что image_size соответствует разрешению модели (h, w)
+    train_scenes = train_builder.build_scenes(image_size=h)
+    
+    train_dataset = ConcatDataset(train_scenes)
+    dataset_weights = train_builder.weight_scenes(train_dataset, alpha=0.75)
+
     # Loss and optimizer
     depth_loss = RobustLosses(
         ce_weight=0.01, 
@@ -225,7 +224,10 @@ def train(args):
     optimizer = torch.optim.AdamW(parameters, weight_decay=0.01)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=[(9*N/romatch.STEP_SIZE)//10])
-    megadense_benchmark = MegadepthDenseBenchmark("data/megadepth", num_samples = 1000, h=h,w=w)
+
+    val_json_path = "/home/sema/radar/datasets/umbra_tiles/pairs_val.json" 
+    umbra_benchmark = UmbraBenchmark(val_json_path, num_samples=1000, h=h, w=w)
+    
     checkpointer = CheckPoint(checkpoint_dir, experiment_name)
     model, optimizer, lr_scheduler, global_step = checkpointer.load(model, optimizer, lr_scheduler, global_step)
     romatch.GLOBAL_STEP = global_step
@@ -233,62 +235,41 @@ def train(args):
     grad_scaler = torch.cuda.amp.GradScaler(growth_interval=1_000_000)
     grad_clip_norm = 0.01
     for n in range(romatch.GLOBAL_STEP, N, k * romatch.STEP_SIZE):
-        mega_sampler = torch.utils.data.WeightedRandomSampler(
-            mega_ws, num_samples = batch_size * k, replacement=False
+        custom_sampler = torch.utils.data.WeightedRandomSampler(
+            dataset_weights, num_samples = batch_size * k, replacement=False
         )
-        mega_dataloader = iter(
+        dataloader = iter(
             torch.utils.data.DataLoader(
-                megadepth_train,
+                train_dataset,
                 batch_size = batch_size,
-                sampler = mega_sampler,
+                sampler = custom_sampler,
                 num_workers = 8,
             )
         )
-        train_k_steps(
-            n, k, mega_dataloader, ddp_model, depth_loss, optimizer, lr_scheduler, grad_scaler, grad_clip_norm = grad_clip_norm,
+        
+        training_metrics = train_k_steps(
+            n, k, dataloader, ddp_model, depth_loss, optimizer, lr_scheduler, grad_scaler, grad_clip_norm = grad_clip_norm,
         )
         checkpointer.save(model, optimizer, lr_scheduler, romatch.GLOBAL_STEP)
-        wandb.log(megadense_benchmark.benchmark(model), step = romatch.GLOBAL_STEP)
+        
+        if rank == 0:
+            # Логирование тренировочных метрик
+            for i, metrics in enumerate(training_metrics):
+                step = n + i * romatch.STEP_SIZE
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        writer.add_scalar(f"train/{key}", value, step)
 
-def test_mega_8_scenes(model, name):
-    mega_8_scenes_benchmark = MegaDepthPoseEstimationBenchmark("data/megadepth",
-                                                scene_names=['mega_8_scenes_0019_0.1_0.3.npz',
-                                                    'mega_8_scenes_0025_0.1_0.3.npz',
-                                                    'mega_8_scenes_0021_0.1_0.3.npz',
-                                                    'mega_8_scenes_0008_0.1_0.3.npz',
-                                                    'mega_8_scenes_0032_0.1_0.3.npz',
-                                                    'mega_8_scenes_1589_0.1_0.3.npz',
-                                                    'mega_8_scenes_0063_0.1_0.3.npz',
-                                                    'mega_8_scenes_0024_0.1_0.3.npz',
-                                                    'mega_8_scenes_0019_0.3_0.5.npz',
-                                                    'mega_8_scenes_0025_0.3_0.5.npz',
-                                                    'mega_8_scenes_0021_0.3_0.5.npz',
-                                                    'mega_8_scenes_0008_0.3_0.5.npz',
-                                                    'mega_8_scenes_0032_0.3_0.5.npz',
-                                                    'mega_8_scenes_1589_0.3_0.5.npz',
-                                                    'mega_8_scenes_0063_0.3_0.5.npz',
-                                                    'mega_8_scenes_0024_0.3_0.5.npz'])
-    mega_8_scenes_results = mega_8_scenes_benchmark.benchmark(model, model_name=name)
-    print(mega_8_scenes_results)
-    json.dump(mega_8_scenes_results, open(f"results/mega_8_scenes_{name}.json", "w"))
-
-def test_mega1500(model, name):
-    mega1500_benchmark = MegaDepthPoseEstimationBenchmark("data/megadepth")
-    mega1500_results = mega1500_benchmark.benchmark(model, model_name=name)
-    json.dump(mega1500_results, open(f"results/mega1500_{name}.json", "w"))
-
-def test_mega_dense(model, name):
-    megadense_benchmark = MegadepthDenseBenchmark("data/megadepth", num_samples = 1000)
-    megadense_results = megadense_benchmark.benchmark(model)
-    json.dump(megadense_results, open(f"results/mega_dense_{name}.json", "w"))
-    
-def test_hpatches(model, name):
-    hpatches_benchmark = HpatchesHomogBenchmark("data/hpatches")
-    hpatches_results = hpatches_benchmark.benchmark(model)
-    json.dump(hpatches_results, open(f"results/hpatches_{name}.json", "w"))
+            # Логирование валидационных метрик
+            benchmark_results = umbra_benchmark.benchmark(model)
+            print(f"Logging to TensorBoard: {benchmark_results}")
+            for key, value in benchmark_results.items():
+                writer.add_scalar(f"val/{key}", value, romatch.GLOBAL_STEP)
 
 
 if __name__ == "__main__":
+    warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
+    warnings.filterwarnings('ignore', category=UserWarning, message=r'.*WARNING batched routines are designed for small sizes.*')
     os.environ["TORCH_CUDNN_V8_API_ENABLED"] = "1" # For BF16 computations
     os.environ["OMP_NUM_THREADS"] = "16"
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -296,10 +277,8 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--only_test", action='store_true')
     parser.add_argument("--debug_mode", action='store_true')
-    parser.add_argument("--dont_log_wandb", action='store_true')
-    parser.add_argument("--train_resolution", default='medium')
-    parser.add_argument("--gpu_batch_size", default=8, type=int)
-    parser.add_argument("--wandb_entity", required = False)
+    parser.add_argument("--train_resolution", default='mega')
+    parser.add_argument("--gpu_batch_size", default=4, type=int)
 
     args, _ = parser.parse_known_args()
     romatch.DEBUG_MODE = args.debug_mode

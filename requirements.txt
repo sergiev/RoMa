@@ -8,7 +8,8 @@ loguru
 tqdm
 matplotlib
 h5py
-wandb
+tensorboard
 timm
 poselib
-#xformers # Optional, used for memefficient attention
+xformers # Optional, used for memefficient attention
+rasterio

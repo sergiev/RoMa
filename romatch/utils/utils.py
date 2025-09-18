@@ -162,35 +162,47 @@ def get_depth_tuple_transform_ops(resize=None, normalize=True, unscale=False):
     return TupleCompose(ops)
 
 
-def get_tuple_transform_ops(resize=None, normalize=True, unscale=False, clahe = False, colorjiggle_params = None):
+def get_tuple_transform_ops(resize=None, normalize=True, unscale=False, clahe = False, colorjiggle_params = None, num_channels=3):
     ops = []
     if resize:
         ops.append(TupleResize(resize))
-    ops.append(TupleToTensorScaled())
+    ops.append(TupleToTensorScaled(num_channels=num_channels))
     if normalize:
+        if num_channels == 3:
+            mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        else:
+            mean, std = [0.5], [0.5]
         ops.append(
-            TupleNormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        )  # Imagenet mean/std
+            TupleNormalize(mean=mean, std=std)
+        )  # Imagenet mean/std for 3 channels, simple normalization for 1
     return TupleCompose(ops)
 
 class ToTensorScaled(object):
-    """Convert a RGB PIL Image to a CHW ordered Tensor, scale the range to [0, 1]"""
+    """Convert a PIL Image to a CHW ordered Tensor, scale the range to [0, 1]"""
+    def __init__(self, num_channels=3):
+        self.num_channels = num_channels
 
     def __call__(self, im):
         if not isinstance(im, torch.Tensor):
-            im = np.array(im, dtype=np.float32).transpose((2, 0, 1))
+            if self.num_channels == 3:
+                im = np.array(im, dtype=np.float32).transpose((2, 0, 1))
+            else: # Single channel
+                im = np.array(im, dtype=np.float32)
+                if len(im.shape) == 2:
+                    im = im[np.newaxis, :, :] # Add channel dimension -> (1, H, W)
+            
             im /= 255.0
             return torch.from_numpy(im)
         else:
             return im
 
     def __repr__(self):
-        return "ToTensorScaled(./255)"
+        return f"ToTensorScaled(./255, num_channels={self.num_channels})"
 
 
 class TupleToTensorScaled(object):
-    def __init__(self):
-        self.to_tensor = ToTensorScaled()
+    def __init__(self, num_channels=3):
+        self.to_tensor = ToTensorScaled(num_channels=num_channels)
 
     def __call__(self, im_tuple):
         return [self.to_tensor(im) for im in im_tuple]
@@ -255,10 +267,8 @@ class TupleNormalize(object):
         self.normalize = transforms.Normalize(mean=mean, std=std)
 
     def __call__(self, im_tuple):
-        c,h,w = im_tuple[0].shape
-        if c > 3:
-            warnings.warn(f"Number of channels c={c} > 3, assuming first 3 are rgb")
-        return [self.normalize(im[:3]) for im in im_tuple]
+        # Original code was slicing to 3 channels, which we don't want for single channel
+        return [self.normalize(im) for im in im_tuple]
 
     def __repr__(self):
         return "TupleNormalize(mean={}, std={})".format(self.mean, self.std)

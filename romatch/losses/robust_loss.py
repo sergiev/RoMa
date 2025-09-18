@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from romatch.utils.utils import get_gt_warp
-import wandb
 import romatch
 import math
 
@@ -57,7 +56,6 @@ class RobustLosses(nn.Module):
             f"gm_certainty_loss_{scale}": certainty_loss.mean(),
             f"gm_cls_loss_{scale}": cls_loss.mean(),
         }
-        wandb.log(losses, step = romatch.GLOBAL_STEP)
         return losses
 
     def delta_cls_loss(self, x2, prob, flow_pre_delta, delta_cls, certainty, scale, offset_scale):
@@ -76,14 +74,15 @@ class RobustLosses(nn.Module):
             f"delta_certainty_loss_{scale}": certainty_loss.mean(),
             f"delta_cls_loss_{scale}": cls_loss.mean(),
         }
-        wandb.log(losses, step = romatch.GLOBAL_STEP)
         return losses
 
     def regression_loss(self, x2, prob, flow, certainty, scale, eps=1e-8, mode = "delta"):
         epe = (flow.permute(0,2,3,1) - x2).norm(dim=-1)
+        
+        losses = {}
         if scale == 1:
             pck_05 = (epe[prob > 0.99] < 0.5 * (2/512)).float().mean()
-            wandb.log({"train_pck_05": pck_05}, step = romatch.GLOBAL_STEP)
+            losses["train_pck_05"] = pck_05
 
         ce_loss = F.binary_cross_entropy_with_logits(certainty[:, 0], prob)
         a = self.alpha[scale] if isinstance(self.alpha, dict) else self.alpha
@@ -92,16 +91,16 @@ class RobustLosses(nn.Module):
         reg_loss = cs**a * ((x/(cs))**2 + 1**2)**(a/2)
         if not torch.any(reg_loss):
             reg_loss = (ce_loss * 0.0)  # Prevent issues where prob is 0 everywhere
-        losses = {
+        losses.update({
             f"{mode}_certainty_loss_{scale}": ce_loss.mean(),
             f"{mode}_regression_loss_{scale}": reg_loss.mean(),
-        }
-        wandb.log(losses, step = romatch.GLOBAL_STEP)
+        })
         return losses
 
     def forward(self, corresps, batch):
         scales = list(corresps.keys())
         tot_loss = 0.0
+        all_losses = {}
         # scale_weights due to differences in scale for regression gradients and classification gradients
         scale_weights = {1:1, 2:1, 4:1, 8:1, 16:1}
         for scale in scales:
@@ -144,18 +143,24 @@ class RobustLosses(nn.Module):
                 gm_cls_losses = self.gm_cls_loss(x2, prob, scale_gm_cls, scale_gm_certainty, scale)
                 gm_loss = self.ce_weight * gm_cls_losses[f"gm_certainty_loss_{scale}"] + gm_cls_losses[f"gm_cls_loss_{scale}"]
                 tot_loss = tot_loss + scale_weights[scale] * gm_loss
+                all_losses.update(gm_cls_losses)
             elif scale_gm_flow is not None:
                 gm_flow_losses = self.regression_loss(x2, prob, scale_gm_flow, scale_gm_certainty, scale, mode = "gm")
                 gm_loss = self.ce_weight * gm_flow_losses[f"gm_certainty_loss_{scale}"] + gm_flow_losses[f"gm_regression_loss_{scale}"]
                 tot_loss = tot_loss + scale_weights[scale] * gm_loss
+                all_losses.update(gm_flow_losses)
             
             if delta_cls is not None:
                 delta_cls_losses = self.delta_cls_loss(x2, prob, flow_pre_delta, delta_cls, scale_certainty, scale, offset_scale)
                 delta_cls_loss = self.ce_weight * delta_cls_losses[f"delta_certainty_loss_{scale}"] + delta_cls_losses[f"delta_cls_loss_{scale}"]
                 tot_loss = tot_loss + scale_weights[scale] * delta_cls_loss
+                all_losses.update(delta_cls_losses)
             else:
                 delta_regression_losses = self.regression_loss(x2, prob, flow, scale_certainty, scale)
                 reg_loss = self.ce_weight * delta_regression_losses[f"delta_certainty_loss_{scale}"] + delta_regression_losses[f"delta_regression_loss_{scale}"]
                 tot_loss = tot_loss + scale_weights[scale] * reg_loss
+                all_losses.update(delta_regression_losses)
             prev_epe = (flow.permute(0,2,3,1) - x2).norm(dim=-1).detach()
-        return tot_loss
+        
+        all_losses['total_loss'] = tot_loss
+        return all_losses
