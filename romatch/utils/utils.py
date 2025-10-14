@@ -659,4 +659,4 @@ def check_not_i16(im):
 
 def check_rgb(im):
     if im.mode != "RGB":
-        raise NotImplementedError("Can't handle non-RGB images")
+        raise NotImplementedError(f"Can't handle non-RGB images: {im.mode}, {type(im)}")

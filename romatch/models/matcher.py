@@ -257,13 +257,15 @@ class GP(nn.Module):
         K_xy = self.K(x, y)
         K_yx = K_xy.permute(0, 2, 1)
         sigma_noise = self.sigma_noise * torch.eye(h2 * w2, device=x.device)[None, :, :]
-        with warnings.catch_warnings():
-            K_yy_inv = torch.linalg.inv(K_yy + sigma_noise)
-
-        mu_x = K_xy.matmul(K_yy_inv.matmul(f))
+        A = K_yy + sigma_noise
+        
+        f_sol = torch.linalg.solve(A, f)
+        mu_x = K_xy.matmul(f_sol)
+        
         mu_x = rearrange(mu_x, "b (h w) d -> b d h w", h=h1, w=w1)
         if not self.no_cov:
-            cov_x = K_xx - K_xy.matmul(K_yy_inv.matmul(K_yx))
+            K_yx_sol = torch.linalg.solve(A, K_yx)
+            cov_x = K_xx - K_xy.matmul(K_yx_sol)
             cov_x = rearrange(cov_x, "b (h w) (r c) -> b h w r c", h=h1, w=w1, r=h1, c=w1)
             local_cov_x = self.get_local_cov(cov_x)
             local_cov_x = rearrange(local_cov_x, "b h w K -> b K h w")
@@ -620,22 +622,20 @@ class RegressionMatcher(nn.Module):
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Check if inputs are file paths or already loaded images
-        if isinstance(im_A_input, (str, os.PathLike)):
-            im_A = Image.open(im_A_input)
-            check_not_i16(im_A)
-            im_A = im_A.convert("RGB")
-        else:
-            check_rgb(im_A_input)
-            im_A = im_A_input
-
-        if isinstance(im_B_input, (str, os.PathLike)):
-            im_B = Image.open(im_B_input)
-            check_not_i16(im_B)
-            im_B = im_B.convert("RGB")
-        else:
-            check_rgb(im_B_input)
-            im_B = im_B_input
+        def preproc(img):
+            # Check if inputs are file paths or already loaded images
+            if isinstance(img, (str, os.PathLike)):
+                img = Image.open(img)
+                check_not_i16(im=img)
+                img = img.convert("RGB")
+            elif isinstance(img, Image.Image):
+                check_rgb(img)
+                img = img
+            else:
+                assert isinstance(img, torch.Tensor), f"{type(img)}"
+            return img
+        im_A = preproc(im_A_input)
+        im_B = preproc(im_B_input)
 
         symmetric = self.symmetric
         self.train(False)

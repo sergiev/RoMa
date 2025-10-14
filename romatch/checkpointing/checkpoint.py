@@ -19,6 +19,7 @@ class CheckPoint:
         optimizer,
         lr_scheduler,
         n,
+        postfix="latest"
         ):
         if romatch.RANK == 0:
             assert model is not None
@@ -30,7 +31,7 @@ class CheckPoint:
                 "optimizer": optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
             }
-            torch.save(states, self.dir + self.name + f"_latest.pth")
+            torch.save(states, f"{self.dir}/{self.name}_{postfix}.pth")
             logger.info(f"Saved states {list(states.keys())}, at step {n}")
     
     def load(
@@ -39,9 +40,13 @@ class CheckPoint:
         optimizer,
         lr_scheduler,
         n,
+        postfix="latest"
         ):
-        if os.path.exists(self.dir + self.name + f"_latest.pth") and romatch.RANK == 0:
-            states = torch.load(self.dir + self.name + f"_latest.pth")
+        path = f"{self.dir}/{self.name}_{postfix}.pth"
+        if not os.path.exists(path):
+            path = f"{self.dir}{self.name}_{postfix}.pth" 
+        if os.path.exists(path) and romatch.RANK == 0:
+            states = torch.load(path)
             if "model" in states:
                 model.load_state_dict(states["model"])
             if "n" in states:

@@ -64,6 +64,7 @@ class VGG19(nn.Module):
         self.layers = nn.ModuleList(tvm.vgg19_bn(pretrained=pretrained).features[:40])
         self.amp = amp
         self.amp_dtype = amp_dtype
+        
 
     def forward(self, x, **kwargs):
         autocast_device, autocast_enabled, autocast_dtype = get_autocast_params(x.device, self.amp, self.amp_dtype)

@@ -3,6 +3,7 @@ from romatch.utils.utils import to_cuda
 import romatch
 import torch
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 def log_param_statistics(named_parameters, norm_type = 2):
     named_parameters = list(named_parameters)
@@ -38,29 +39,61 @@ def train_step(train_batch, model, objective, optimizer, grad_scaler, grad_clip_
 
 
 def train_k_steps(
-    n_0, k, dataloader, model, objective, optimizer, lr_scheduler, grad_scaler, progress_bar=True, grad_clip_norm = 1., warmup = None, ema_model = None, pbar_n_seconds = 1,
+    n_0,
+    k,
+    dataloader,
+    model,
+    objective,
+    optimizer,
+    lr_scheduler,
+    grad_scaler,
+    progress_bar=True,
+    grad_clip_norm=1.0,
+    warmup=None,
+    ema_model=None,
+    pbar_n_seconds=1,
+    accumulation_steps=1,
+    writer=None,
+    vis_callback=None,
 ):
     for n in tqdm(range(n_0, n_0 + k), disable=(not progress_bar) or romatch.RANK > 0, mininterval=pbar_n_seconds):
         batch = next(dataloader)
         model.train(True)
         batch = to_cuda(batch)
-        train_step(
-            train_batch=batch,
-            model=model,
-            objective=objective,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            grad_scaler=grad_scaler,
-            n=n,
-            grad_clip_norm = grad_clip_norm,
-        )
+
+        if n == 0 and vis_callback is not None:
+            vis_callback(batch)
+            model.train(True)  # Re-set model to training mode
+
+        # Gradient accumulation
+        loss = objective(model(batch), batch) / accumulation_steps
+        grad_scaler.scale(loss).backward()
+
+        if (n + 1) % accumulation_steps == 0:
+            grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            optimizer.zero_grad()
+            if not isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                if warmup is not None:
+                    with warmup.dampening():
+                        lr_scheduler.step()
+                else:
+                    lr_scheduler.step()
+
+        wandb.log({"train_loss": loss.item() * accumulation_steps}, step=romatch.GLOBAL_STEP)
+        if isinstance(writer, SummaryWriter):
+            writer.add_scalar("Train/loss", scalar_value=loss.item() * accumulation_steps, global_step=romatch.GLOBAL_STEP)
+            [
+                writer.add_scalar(f"Train/lr_group_{grp}", scalar_value=lr, global_step=romatch.GLOBAL_STEP)
+                for grp, lr in enumerate(lr_scheduler.get_last_lr())
+            ]
+        romatch.GLOBAL_STEP += romatch.STEP_SIZE
+
         if ema_model is not None:
             ema_model.update()
-        if warmup is not None:
-            with warmup.dampening():
-                lr_scheduler.step()
-        else:
-            lr_scheduler.step()
+
         [wandb.log({f"lr_group_{grp}": lr}) for grp, lr in enumerate(lr_scheduler.get_last_lr())]
 
 

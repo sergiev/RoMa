@@ -2,6 +2,7 @@ from einops.einops import rearrange
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 from romatch.utils.utils import get_gt_warp
 import wandb
 import romatch
@@ -23,6 +24,8 @@ class RobustLosses(nn.Module):
         relative_depth_error_threshold = 0.05,
         alpha = 1.,
         c = 1e-3,
+        scale_weights = {1:1, 2:1, 4:1, 8:1, 16:1},
+        tb_writer: SummaryWriter = None,
     ):
         super().__init__()
         self.robust = robust  # measured in pixels
@@ -39,7 +42,9 @@ class RobustLosses(nn.Module):
         self.avg_overlap = dict()
         self.alpha = alpha
         self.c = c
-
+        self.scale_weights = scale_weights
+        self.tb_writer = tb_writer
+        
     def gm_cls_loss(self, x2, prob, scale_gm_cls, gm_certainty, scale):
         with torch.no_grad():
             B, C, H, W = scale_gm_cls.shape
@@ -57,7 +62,11 @@ class RobustLosses(nn.Module):
             f"gm_certainty_loss_{scale}": certainty_loss.mean(),
             f"gm_cls_loss_{scale}": cls_loss.mean(),
         }
+        if self.tb_writer:
+            for k,v in losses.items():
+                self.tb_writer.add_scalar("train/" + k, v.item(), romatch.GLOBAL_STEP)
         wandb.log(losses, step = romatch.GLOBAL_STEP)
+        
         return losses
 
     def delta_cls_loss(self, x2, prob, flow_pre_delta, delta_cls, certainty, scale, offset_scale):
@@ -76,14 +85,18 @@ class RobustLosses(nn.Module):
             f"delta_certainty_loss_{scale}": certainty_loss.mean(),
             f"delta_cls_loss_{scale}": cls_loss.mean(),
         }
+        if self.tb_writer:
+            for k,v in losses.items():
+                self.tb_writer.add_scalar("train/" + k, v.item(), romatch.GLOBAL_STEP)
         wandb.log(losses, step = romatch.GLOBAL_STEP)
         return losses
 
     def regression_loss(self, x2, prob, flow, certainty, scale, eps=1e-8, mode = "delta"):
         epe = (flow.permute(0,2,3,1) - x2).norm(dim=-1)
+        losses = {}
         if scale == 1:
             pck_05 = (epe[prob > 0.99] < 0.5 * (2/512)).float().mean()
-            wandb.log({"train_pck_05": pck_05}, step = romatch.GLOBAL_STEP)
+            losses |= {"pck_05": pck_05}
 
         ce_loss = F.binary_cross_entropy_with_logits(certainty[:, 0], prob)
         a = self.alpha[scale] if isinstance(self.alpha, dict) else self.alpha
@@ -92,10 +105,13 @@ class RobustLosses(nn.Module):
         reg_loss = cs**a * ((x/(cs))**2 + 1**2)**(a/2)
         if not torch.any(reg_loss):
             reg_loss = (ce_loss * 0.0)  # Prevent issues where prob is 0 everywhere
-        losses = {
+        losses |= {
             f"{mode}_certainty_loss_{scale}": ce_loss.mean(),
             f"{mode}_regression_loss_{scale}": reg_loss.mean(),
         }
+        if self.tb_writer:
+            for k,v in losses.items():
+                self.tb_writer.add_scalar("train/" + k, v.item(), romatch.GLOBAL_STEP)
         wandb.log(losses, step = romatch.GLOBAL_STEP)
         return losses
 
@@ -103,7 +119,7 @@ class RobustLosses(nn.Module):
         scales = list(corresps.keys())
         tot_loss = 0.0
         # scale_weights due to differences in scale for regression gradients and classification gradients
-        scale_weights = {1:1, 2:1, 4:1, 8:1, 16:1}
+        scale_weights = self.scale_weights
         for scale in scales:
             scale_corresps = corresps[scale]
             scale_certainty, flow_pre_delta, delta_cls, offset_scale, scale_gm_cls, scale_gm_certainty, flow, scale_gm_flow = (
