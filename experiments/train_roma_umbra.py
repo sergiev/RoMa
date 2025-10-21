@@ -25,9 +25,8 @@ from romatch.models.transformer import Block, TransformerDecoder, MemEffAttentio
 from romatch.models.encoders import *
 from romatch.models.planar_decoder import PlanarDecoder, SimplifiedGlobalMatcher
 from romatch.checkpointing import CheckPoint
-from romatch.utils import warp_kpts
 from torch.utils.tensorboard import SummaryWriter
-from romatch.tools.visualize_pipeline import visualize_matches
+from romatch.tools.visualize_pipeline import visualize_total
 
 
 resolutions = {
@@ -42,13 +41,14 @@ resolutions = {
 def get_planar_model(pretrained_backbone=True, resolution="medium", **kwargs):
     """
     Создает модель с оптимизированным декодером для planar scenes (SAR).
-    
+
     Основные отличия:
     - SimplifiedGlobalMatcher вместо GP + TransformerDecoder
     - Увеличенные радиусы local correlation (11, 7, 4 вместо 7, 3, 2)
     - Прямая regression вместо classification
     """
     import warnings
+
     warnings.filterwarnings("ignore", category=UserWarning, message="TypedStorage is deprecated")
 
     # ConvRefiners с увеличенными радиусами для SAR
@@ -144,13 +144,15 @@ def get_planar_model(pretrained_backbone=True, resolution="medium", **kwargs):
     proj2 = nn.Sequential(nn.Conv2d(128, 64, 1, 1), nn.BatchNorm2d(64))
     proj1 = nn.Sequential(nn.Conv2d(64, 9, 1, 1), nn.BatchNorm2d(9))
 
-    proj = nn.ModuleDict({
-        "16": proj16,
-        "8": proj8,
-        "4": proj4,
-        "2": proj2,
-        "1": proj1,
-    })
+    proj = nn.ModuleDict(
+        {
+            "16": proj16,
+            "8": proj8,
+            "4": proj4,
+            "2": proj2,
+            "1": proj1,
+        }
+    )
 
     # Planar decoder
     decoder = PlanarDecoder(
@@ -367,9 +369,9 @@ def train(args):
         print(f"TensorBoard logging to: {tb_log_dir}")
 
     h, w = resolutions[resolution]
-    
+
     # Использовать planar decoder для SAR
-    use_planar_decoder = getattr(args, 'use_planar_decoder', True)
+    use_planar_decoder = getattr(args, "use_planar_decoder", True)
     if use_planar_decoder:
         print("Using PlanarDecoder optimized for SAR orthophotos")
         model = get_planar_model(pretrained_backbone=True, resolution=resolution, attenuate_cert=False).to(device_id)
@@ -407,13 +409,19 @@ def train(args):
     umbra_ws = torch.ones(len(umbra_train))
 
     depth_loss = RobustLosses(
-        ce_weight=0.03,              # было 0.01 → +200% для certainty
-        local_dist={1: 8, 2: 12, 4: 16, 8: 20},  # было {1:4, 2:4, 4:8, 8:8} → {1:6, 2:6, 4:12, 8:12}
-        local_largest_scale=8,       # без изменений
-        depth_interpolation_mode="bilinear",  # без изменений
-        alpha=0.5,                   # без изменений
-        c=3e-4,                      # было 1e-4 → +200% порог
-        scale_weights={1:1.5, 2:1, 4:0.7, 8:0.5, 16:0.2}  # новое (SAR имеет меньшую точность на грубых масштабах → уменьшить их вклад в loss)
+        ce_weight=0.03,  # было 0.01 → +200% для certainty
+        local_dist={1:6, 2:6, 4:12, 8:12},  # было {1:4, 2:4, 4:8, 8:8} → {1:6, 2:6, 4:12, 8:12}
+        local_largest_scale=8,  # без изменений
+        alpha=0.5,  # без изменений
+        c=3e-4,  # было 1e-4 → +200% порог
+        scale_weights={
+            1: 1.5,
+            2: 1,
+            4: 0.7,
+            8: 0.5,
+            16: 0.2,
+        },  # новое (SAR имеет меньшую точность на грубых масштабах → уменьшить их вклад в loss)
+        planar_mode=args.planar_mode,
     )
     parameters = [
         {"params": model.encoder.parameters(), "lr": romatch.STEP_SIZE * 5e-6},
@@ -432,7 +440,9 @@ def train(args):
             val_scene_info = json.load(f)
 
         vis_dir = os.path.join(args.checkpoint_dir, "visualizations")
-        umbra_benchmark = UmbraDenseBenchmark(scene_info=val_scene_info, image_size=h, vis_dir=vis_dir)
+        umbra_benchmark = UmbraDenseBenchmark(
+            scene_info=val_scene_info, image_size=h, vis_dir=vis_dir, planar_mode=args.planar_mode
+        )
     else:
         umbra_benchmark = None
         print("No validation data provided, skipping benchmark")
@@ -440,16 +450,14 @@ def train(args):
     # Checkpointer
     checkpointer = CheckPoint(checkpoint_dir, experiment_name)
     if args.flush:
-        model, _, _, _ = checkpointer.load(
-            model, optimizer, lr_scheduler, n=global_step, postfix="best"
-        )
+        model, _, _, _ = checkpointer.load(model, optimizer, lr_scheduler, n=global_step, postfix="best")
     else:
         model, optimizer, lr_scheduler, global_step = checkpointer.load(
             model, optimizer, lr_scheduler, n=global_step, postfix="best"
         )
     romatch.GLOBAL_STEP = global_step
 
-    def tb_visualize_callback(batch):
+    def tb_visualize_callback(batch, step):
         """Callback для визуализации одного батча в TensorBoard."""
         if tb_writer is None or rank != 0:
             return
@@ -461,21 +469,22 @@ def train(args):
         with torch.no_grad():
             matches, certainty = model.match(im_A, im_B, batched=True)
         figures = [
-            visualize_matches(
+            visualize_total(
                 im_A=im_A[b],
                 im_B=im_B[b],
                 matches=matches[b],
                 certainty=certainty[b],
-                depth1=batch["im_A_depth"][b],
-                depth2=batch["im_B_depth"][b],
                 T_1to2=batch["T_1to2"][b],
                 K1=batch["K1"][b],
                 K2=batch["K2"][b],
+                depth1=batch["im_A_depth"][b],
+                depth2=batch["im_B_depth"][b],
+                planar_mode=args.planar_mode,
             )[0]
             for b in range(batch_size)
         ]
         for i, fig in enumerate(figures):
-            tb_writer.add_figure(f"Train/match_visualization_{i}", fig, global_step=romatch.GLOBAL_STEP)
+            tb_writer.add_figure(f"Train/match_visualization_{i}", fig, global_step=step)
 
     # DDP модель
     ddp_model = DDP(model, device_ids=[device_id], find_unused_parameters=False, gradient_as_bucket_view=True)
@@ -569,8 +578,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_workers", default=4, type=int, help="Количество worker'ов для DataLoader")
     parser.add_argument("--wandb_entity", required=False, help="WandB entity")
-    parser.add_argument("--flush",  action="store_true", help="Не использовать global_step и состояние lr_scheduler")
-    parser.add_argument("--use_planar_decoder", action="store_true", default=True, help="Использовать PlanarDecoder вместо стандартного")
+    parser.add_argument("--flush", action="store_true", help="Не использовать global_step и состояние lr_scheduler")
+    parser.add_argument(
+        "--use_planar_decoder", action="store_true", default=True, help="Использовать PlanarDecoder вместо стандартного"
+    )
+    parser.add_argument(
+        "--planar_mode", action="store_true", default=True, help="Использовать 2D геометрию для planar сцен (SAR)"
+    )
 
     args, _ = parser.parse_known_args()
     romatch.DEBUG_MODE = args.debug_mode

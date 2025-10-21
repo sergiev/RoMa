@@ -62,7 +62,7 @@ def train_k_steps(
         batch = to_cuda(batch)
 
         if n == 0 and vis_callback is not None:
-            vis_callback(batch)
+            vis_callback(batch, romatch.GLOBAL_STEP)
             model.train(True)  # Re-set model to training mode
 
         # Gradient accumulation

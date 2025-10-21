@@ -1,4 +1,4 @@
-OUT_DIR=workspace/20251012_medium_planar
+OUT_DIR=workspace/20251016_medium_planar
 EXP_SCRIPT=experiments/train_roma_umbra.py
 mkdir -p $OUT_DIR
 cp $EXP_SCRIPT $OUT_DIR

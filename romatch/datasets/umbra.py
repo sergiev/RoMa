@@ -51,7 +51,7 @@ class UmbraScene(Dataset):
             shake_t: максимальный сдвиг в пикселях для random translation
         """
         self.image_paths = scene_info["image_paths"]
-        self.pairs = scene_info["pairs"]
+        self.original_pairs = scene_info["pairs"]
         self.scene_name = scene_name
         self.image_size = image_size
         
@@ -64,6 +64,50 @@ class UmbraScene(Dataset):
             resize=(image_size, image_size),
             normalize=True,
         )
+        
+        # Валидация и фильтрация пар при инициализации
+        self.pairs = self._validate_and_filter_pairs()
+
+    def _validate_and_filter_pairs(self):
+        """
+        Проверяет все пары на валидность геометрического преобразования.
+        Удаляет пары, приводящие к сингулярной матрице гомографии.
+        """
+        print(f"[{self.scene_name}] Запуск валидации для {len(self.original_pairs)} пар...")
+        valid_pairs = []
+        invalid_count = 0
+        for idx1, idx2 in self.original_pairs:
+            try:
+                # Используем ту же логику загрузки, что и в __getitem__, чтобы размеры совпадали
+                im1_pil, affine1, _ = self.load_im_and_georef(self.image_paths[idx1])
+                im2_pil, affine2, _ = self.load_im_and_georef(self.image_paths[idx2])
+
+                # Вычисляем гомографию, используя актуальный размер изображения после возможного кропа
+                H_np = self.compute_homography(affine1, affine2, im1_pil.size, self.image_size)
+                
+                # Преобразуем в torch.tensor float32, чтобы точно имитировать условия сбоя
+                H_torch = torch.from_numpy(H_np).float()
+                R_torch = H_torch[:2, :2]
+                
+                # Проверяем определитель, используя torch
+                determinant = torch.det(R_torch)
+                if abs(determinant) < 1e-8:
+                    # Эта пара приведет к сингулярной матрице
+                    invalid_count += 1
+                    continue # Пропускаем эту пару
+                    
+                valid_pairs.append((idx1, idx2))
+            except Exception as e:
+                # Также отлавливаем другие возможные ошибки при чтении файлов
+                print(f"[{self.scene_name}] Ошибка при обработке пары ({idx1}, {idx2}): {e}. Пара будет пропущена.")
+                invalid_count += 1
+
+        if invalid_count > 0:
+            print(f"[{self.scene_name}] Валидация завершена. Найдено и удалено {invalid_count} проблемных пар.")
+        else:
+            print(f"[{self.scene_name}] Валидация завершена. Все пары корректны.")
+            
+        return valid_pairs
 
     def __len__(self):
         return len(self.pairs)
@@ -138,57 +182,38 @@ class UmbraScene(Dataset):
 
     def homography_to_K_and_T(self, H, image_size):
         """
-        Разлагает гомографию на K и T для совместимости с RoMa.
-        
-        Для planar scene с ортографической проекцией:
-        H ≈ K2 @ R @ K1^-1
-        
-        Мы используем упрощенный подход:
-        - K1 = K2 = identity (масштабирование в пикселях)
-        - R извлекается из H
-        - T содержит только planar transformation
+        Decomposes homography into K and T for RoMa compatibility.
+        For a planar scene, T_1to2 is derived from the homography H
+        that maps normalized coordinates from image 1 to image 2.
         """
-        # Нормализуем H
-        H = H / H[2, 2]
-        
-        # Для ортографических изображений используем простую K
+        # For orthographic images, we use a simple K
         K = np.eye(3, dtype=np.float32)
-        K[0, 2] = image_size / 2  # principal point
-        K[1, 2] = image_size / 2
         
-        # Создаем 4x4 трансформацию
-        # Для planar scene, z-координата не меняется
+        # The transformation T should directly represent the homography effect
+        # on normalized coordinates.
         T = np.eye(4, dtype=np.float32)
         
-        # SVD для извлечения rotation
-        U, S, Vt = np.linalg.svd(H[0:2, 0:2])
-        R_2d = U @ Vt
+        # The 2x2 part of H is the rotation and scale component
+        T[0:2, 0:2] = H[0:2, 0:2]
         
-        # Встраиваем 2D rotation в 3D (вращение вокруг Z оси)
-        T[0:2, 0:2] = R_2d
-        
-        # Translation (нормализованный)
+        # The translation part of H
         T[0, 3] = H[0, 2]
         T[1, 3] = H[1, 2]
-        T[2, 3] = 0.0  # z-translation = 0 для planar scene
         
         return K, T
 
-    def horizontal_flip(self, im_A, im_B, K1, K2):
-        """Horizontal flip augmentation с корректировкой intrinsics"""
+    def horizontal_flip(self, im_A, im_B, K1, K2, T_1to2):
+        """Horizontal flip augmentation with correction for T_1to2"""
         im_A = im_A.flip(-1)
         im_B = im_B.flip(-1)
         
-        flip_mat = torch.tensor([
-            [-1, 0, self.image_size],
-            [0, 1, 0],
-            [0, 0, 1.]
-        ], dtype=K1.dtype, device=K1.device)
+        # Adjust T_1to2 for horizontal flip
+        # x' = -x => in normalized coords, this flips the sign of x component
+        flip_mat = torch.tensor([[-1, 0], [0, 1]], dtype=T_1to2.dtype, device=T_1to2.device)
+        T_1to2[:2, :2] = flip_mat @ T_1to2[:2, :2] @ flip_mat
+        T_1to2[0, 3] = -T_1to2[0, 3] # Translation also flips
         
-        K1 = flip_mat @ K1
-        K2 = flip_mat @ K2
-        
-        return im_A, im_B, K1, K2
+        return im_A, im_B, K1, K2, T_1to2
     
     def vertical_flip(self, im_A, im_B, K1, K2):
         """Vertical flip augmentation с корректировкой intrinsics"""
@@ -222,38 +247,38 @@ class UmbraScene(Dataset):
 
         im1_pil, affine1, orig_size1 = self.load_im_and_georef(path1)
         im2_pil, affine2, orig_size2 = self.load_im_and_georef(path2)
-
-        # Применяем стандартные трансформации (resize + normalize) БЕЗ shake
-        im1, im2 = self.im_transform_ops((im1_pil, im2_pil))
-
-        # --- Вычисление геометрических данных из геопривязки ---
         
-        # Вычисляем гомографию с учетом оригинальных размеров
-        H = self.compute_homography(affine1, affine2, orig_size1, self.image_size)
+        # --- Вычисление геометрических данных из геопривязки ---
+        # Теперь гомография вычисляется здесь, используя актуальные размеры
+        H = self.compute_homography(affine1, affine2, im1_pil.size, self.image_size)
         
         # Разлагаем гомографию на K и T
         K, T_1to2 = self.homography_to_K_and_T(H, self.image_size)
-        
+
+        # Применяем стандартные трансформации (resize + normalize)
+        im1, im2 = self.im_transform_ops((im1_pil, im2_pil))
+
         # Для Umbra SAR обе камеры имеют одинаковые intrinsics (ортографическая проекция)
         K1 = torch.from_numpy(K).float()
         K2 = torch.from_numpy(K).float()
         T_1to2 = torch.from_numpy(T_1to2).float()
         
-        # Создание карты глубины (ДО shake, чтобы можно было применить shake к depth тоже)
+        # Создание карты глубины
         depth_value = 1.0
         depth1 = torch.ones(1, self.image_size, self.image_size) * depth_value
         depth2 = torch.ones(1, self.image_size, self.image_size) * depth_value
         
-        # Random shake ПОСЛЕ нормализации (применяется к тензорам)
-        # Корректируем K матрицы для сохранения геометрии
+        # Random shake
         if self.shake_t > 0:
             [im1, im2, depth1, depth2], t = self.rand_shake(im1, im2, depth1, depth2)
-            K1[:2, 2] += torch.tensor(t, dtype=torch.float32)
-            K2[:2, 2] += torch.tensor(t, dtype=torch.float32)
-        
-        # Horizontal flip ПОСЛЕ shake (применяется к тензорам)
+            
+            t_norm = t / self.image_size * 2
+            T_1to2[0, 3] -= t_norm[0]
+            T_1to2[1, 3] -= t_norm[1]
+
+        # Horizontal flip
         if self.use_horizontal_flip_aug and np.random.rand() > 0.5:
-            im1, im2, K1, K2 = self.horizontal_flip(im1, im2, K1, K2)
+            im1, im2, K1, K2, T_1to2 = self.horizontal_flip(im1, im2, K1, K2, T_1to2)
         
         # Vertical flip
         if self.use_vertical_flip_aug and np.random.rand() > 0.5:
@@ -262,7 +287,7 @@ class UmbraScene(Dataset):
         return {
             "im_A": im1,
             "im_B": im2,
-            "im_A_depth": depth1.squeeze(0),  # Remove batch dimension
+            "im_A_depth": depth1.squeeze(0),
             "im_B_depth": depth2.squeeze(0),
             "K1": K1,
             "K2": K2,

@@ -371,10 +371,8 @@ def train(args):
     depth_loss = RobustLosses(
         ce_weight=0.01, 
         local_dist={4:4},
-        depth_interpolation_mode=depth_interpolation_mode,
         alpha = {4:0.15, 8:0.15},
         c = 1e-4,
-        epe_mask_prob_th = 0.001,
         )
     parameters = [
         {"params": model.parameters(), "lr": romatch.STEP_SIZE * 1e-4 / 8},

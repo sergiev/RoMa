@@ -221,7 +221,6 @@ def train(args):
         ce_weight=0.0, 
         local_dist={1:4, 2:4, 4:8, 8:8},
         local_largest_scale=8,
-        depth_interpolation_mode=depth_interpolation_mode,
         alpha = 0.5,
         c = 1e-4,)
     # Loss and optimizer
@@ -229,7 +228,6 @@ def train(args):
         ce_weight=0.01, 
         local_dist={1:4, 2:4, 4:8, 8:8},
         local_largest_scale=8,
-        depth_interpolation_mode=depth_interpolation_mode,
         alpha = 0.5,
         c = 1e-4,)
     parameters = [

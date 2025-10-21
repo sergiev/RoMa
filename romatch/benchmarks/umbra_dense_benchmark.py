@@ -8,16 +8,14 @@ UmbraDenseBenchmark - бенчмарк для оценки качества со
 """
 
 import torch
-import numpy as np
 import tqdm
-from romatch.utils import warp_kpts, tensor_to_pil
-from torch.utils.data import ConcatDataset
+from romatch.utils import warp_kpts, warp_kpts_planar
 import romatch
 import os
-from romatch.tools.visualize_pipeline import visualize_matches
+from romatch.tools.visualize_pipeline import visualize_total
 
 class UmbraDenseBenchmark:
-    def __init__(self, scene_info, image_size=640, vis_dir=None) -> None:
+    def __init__(self, scene_info, image_size=640, vis_dir=None, planar_mode=False) -> None:
         """
         Args:
             scene_info: словарь с ключами 'image_paths' и 'pairs'
@@ -28,6 +26,7 @@ class UmbraDenseBenchmark:
 
         self.dataset = UmbraScene(scene_info, image_size=image_size, scene_name="umbra_val")
         self.vis_dir = vis_dir
+        self.planar_mode = planar_mode
         if self.vis_dir is not None:
             os.makedirs(self.vis_dir, exist_ok=True)
 
@@ -36,14 +35,20 @@ class UmbraDenseBenchmark:
         b, h1, w1, d = dense_matches.shape
         with torch.no_grad():
             x1 = dense_matches[..., :2].reshape(b, h1 * w1, 2)
-            mask, x2 = warp_kpts(
-                x1.double(),
-                depth1.double(),
-                depth2.double(),
-                T_1to2.double(),
-                K1.double(),
-                K2.double(),
-            )
+            if self.planar_mode:
+                mask, x2 = warp_kpts_planar(
+                    x1.double(),
+                    T_1to2.double()
+                )
+            else:
+                mask, x2 = warp_kpts(
+                    x1.double(),
+                    depth1.double(),
+                    depth2.double(),
+                    T_1to2.double(),
+                    K1.double(),
+                    K2.double(),
+                )
             x2 = torch.stack((w1 * (x2[..., 0] + 1) / 2, h1 * (x2[..., 1] + 1) / 2), dim=-1)
             prob = mask.float().reshape(b, h1, w1)
         x2_hat = dense_matches[..., 2:]
@@ -99,16 +104,17 @@ class UmbraDenseBenchmark:
                 # Визуализация
                 if self.vis_dir is not None and idx < 1:  # визуализируем только первый батч
                     results["visual"] = [
-                        visualize_matches(
-                            im_A[b],
-                            im_B[b],
-                            matches[b],
-                            certainty[b],
-                            depth1[b],
-                            depth2[b],
-                            T_1to2[b],
-                            K1[b],
-                            K2[b]
+                        visualize_total(
+                            im_A=im_A[b],
+                            im_B=im_B[b],
+                            matches=matches[b],
+                            certainty=certainty[b],
+                            T_1to2=T_1to2[b],
+                            K1=K1[b],
+                            K2=K2[b],
+                            depth1=depth1[b],
+                            depth2=depth2[b],
+                            planar_mode=self.planar_mode,
                         )[0]
                         for b in range(min(B, im_A.shape[0]))
                     ]

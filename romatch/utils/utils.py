@@ -354,6 +354,63 @@ def get_gt_warp(depth1, depth2, T_1to2, K1, K2, depth_interpolation_mode = 'bili
         x2 = x2.reshape(B, H, W, 2)
         return x2, prob
 
+def get_inverse_T(T):
+    """Computes the inverse of a 4x4 homogeneous transformation matrix for 2D affine transformations."""
+    if T.dim() == 2:
+        # Handle single matrix
+        T_inv = torch.eye(4, device=T.device, dtype=T.dtype)
+        R = T[:2, :2]
+        t = T[:2, 3]
+        R_inv = torch.linalg.inv(R)
+        t_inv = -R_inv @ t
+        T_inv[:2, :2] = R_inv
+        T_inv[:2, 3] = t_inv
+    elif T.dim() == 3:
+        # Handle batch of matrices
+        B = T.shape[0]
+        T_inv = torch.eye(4, device=T.device, dtype=T.dtype).unsqueeze(0).expand(B, -1, -1).clone()
+        R = T[:, :2, :2]
+        t = T[:, :2, 3]
+        R_inv = torch.linalg.inv(R)
+        t_inv = -torch.bmm(R_inv, t.unsqueeze(-1)).squeeze(-1)
+        T_inv[:, :2, :2] = R_inv
+        T_inv[:, :2, 3] = t_inv
+    else:
+        raise ValueError(f"Unsupported tensor dimension: {T.dim()}")
+        
+    return T_inv
+
+@torch.no_grad()
+def get_gt_warp_planar(T_1to2, H, W, **kwargs):
+    """
+    Computes the ground truth warped coordinates and valid mask for planar scenes.
+    """
+    device = T_1to2.device
+    B = T_1to2.shape[0]
+
+    # Create a grid of normalized coordinates for a single image
+    y_coords, x_coords = torch.meshgrid(
+        torch.linspace(-1 + 1 / H, 1 - 1 / H, H, device=device),
+        torch.linspace(-1 + 1 / W, 1 - 1 / W, W, device=device),
+        indexing='ij'
+    )
+    
+    # Stack to get (H, W, 2) and reshape to (1, L, 2) where L=H*W
+    x1_norm_single = torch.stack([x_coords, y_coords], dim=-1).view(1, H * W, 2)
+    
+    # Expand the grid to match the batch size of the transformation matrix
+    x1_norm = x1_norm_single.expand(B, -1, -1)
+    
+    # Warp keypoints. `warp_kpts_planar` expects (N, L, 2) and (N, 4, 4)
+    prob_mask, x2_gt_norm = warp_kpts_planar(x1_norm, T_1to2)
+    
+    # Reshape to image dimensions for the loss function
+    x2_gt_norm = x2_gt_norm.view(B, H, W, 2)
+    prob_mask = prob_mask.view(B, H, W)
+    
+    return x2_gt_norm, prob_mask
+
+
 @torch.no_grad()
 def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1, smooth_mask = False, return_relative_depth_error = False, depth_interpolation_mode = "bilinear", relative_depth_error_threshold = 0.05):
     """Warp kpts0 from I0 to I1 with depth, K and Rt
@@ -406,7 +463,7 @@ def warp_kpts(kpts0, depth0, depth1, T_0to1, K0, K1, smooth_mask = False, return
     # Sample depth, get calculable_mask on depth != 0
     nonzero_mask = kpts0_depth != 0
 
-    # Unproject
+    # Unproject from image plane to camera plane
     kpts0_h = (
         torch.cat([kpts0, torch.ones_like(kpts0[:, :, [0]])], dim=-1)
         * kpts0_depth[..., None]
@@ -660,3 +717,40 @@ def check_not_i16(im):
 def check_rgb(im):
     if im.mode != "RGB":
         raise NotImplementedError(f"Can't handle non-RGB images: {im.mode}, {type(im)}")
+
+@torch.no_grad()
+def warp_kpts_planar(kpts0_norm, T_0to1):
+    """
+    Warps keypoints for planar scenes (like SAR orthophotos) using a 2D affine transformation.
+    Returns a probabilistic mask based on the distance from the image border.
+    
+    Args:
+        kpts0_norm (torch.Tensor): [N, L, 2] - Normalized keypoints in image 0, in range (-1, 1).
+        T_0to1 (torch.Tensor): [N, 4, 4] - Homogeneous transformation matrix from image 0 to 1.
+        
+    Returns:
+        prob_mask (torch.Tensor): [N, L] - A probabilistic mask of points' validity.
+        kpts1_norm (torch.Tensor): [N, L, 2] - Warped normalized keypoints in image 1.
+    """
+    
+    device = kpts0_norm.device
+    T_0to1 = T_0to1.to(device)
+
+    # Extract 2x2 rotation and 2x1 translation, which operate on normalized coordinates
+    R = T_0to1[:, :2, :2]      # (N, 2, 2)
+    t_norm = T_0to1[:, :2, 3:4] # (N, 2, 1)
+
+    # Transpose keypoints for matrix multiplication
+    kpts0_norm_T = kpts0_norm.transpose(1, 2) # (N, 2, L)
+    
+    # Apply affine transformation in normalized coordinates: kpts' = R @ kpts + t
+    kpts1_norm_T = R @ kpts0_norm_T + t_norm
+    
+    # Transpose back to original shape
+    kpts1_norm = kpts1_norm_T.transpose(1, 2) # (N, L, 2)
+    
+    # --- FIX: Replace probabilistic mask with a hard binary mask ---
+    # Create a binary mask. A point is valid if both its x and y coordinates are within [-1, 1].
+    valid_mask = (kpts1_norm[..., 0].abs() <= 1) & (kpts1_norm[..., 1].abs() <= 1) # (N, L)
+
+    return valid_mask.float(), kpts1_norm
