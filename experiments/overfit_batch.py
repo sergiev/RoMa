@@ -1,14 +1,15 @@
 import argparse
+from romatch.utils import warp_kpts, warp_kpts_planar
 import torch
 import json
 import numpy as np
-import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 import sys
 import os
+from torch.utils.tensorboard import SummaryWriter
 
 # Добавляем корень проекта в PYTHONPATH для корректного импорта
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), 'RoMa'))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -16,95 +17,109 @@ from romatch.datasets.umbra import UmbraScene
 from experiments.train_roma_umbra import get_planar_model
 from romatch.losses.robust_loss import RobustLosses
 from romatch.tools.visualize_pipeline import visualize_total
-from romatch.utils import warp_kpts_planar
+from romatch.train.train import train_k_steps
 import romatch as romatch
 import wandb
 
 
-def get_matches_from_flow(flow):
-    """
-    Преобразует поле потока (flow) в формат соответствий (matches).
-    """
-    # flow приходит в формате [B, 2, H, W]
-    B, _, H, W = flow.shape
-    device = flow.device
-    
-    # Создаем сетку нормализованных координат для изображения A
-    y_coords, x_coords = torch.meshgrid(
-        torch.linspace(-1, 1, H, device=device),
-        torch.linspace(-1, 1, W, device=device),
-        indexing='ij'
-    )
-    # grid в формате [H, W, 2]
-    grid = torch.stack((x_coords, y_coords), dim=-1)
-    # expand до [B, H, W, 2]
-    grid = grid.unsqueeze(0).expand(B, -1, -1, -1)
-    
-    # Приводим flow к формату [B, H, W, 2] для сложения
-    flow_permuted = flow.permute(0, 2, 3, 1)
-    
-    # Координаты в изображении B = координаты в A + смещение (flow)
-    coords_B = grid + flow_permuted
-    
-    # Объединяем в формат matches (xA, yA, xB, yB)
-    matches = torch.cat([grid, coords_B], dim=-1)
-    return matches
+def geometric_dist(dense_matches, depth1, depth2, T_1to2, K1, K2, planar_mode):
+    """Вычисляет геометрическое расстояние между предсказанными и истинными соответствиями"""
+    b, h1, w1, d = dense_matches.shape
+    with torch.no_grad():
+        x1 = dense_matches[..., :2].reshape(b, h1 * w1, 2)
+        if planar_mode:
+            mask, x2 = warp_kpts_planar(x1.double(), T_1to2.double())
+        else:
+            mask, x2 = warp_kpts(
+                x1.double(),
+                depth1.double(),
+                depth2.double(),
+                T_1to2.double(),
+                K1.double(),
+                K2.double(),
+            )
+        x2 = torch.stack((w1 * (x2[..., 0] + 1) / 2, h1 * (x2[..., 1] + 1) / 2), dim=-1)
+        prob = mask.float().reshape(b, h1, w1)
+    x2_hat = dense_matches[..., 2:]
+    x2_hat = torch.stack((w1 * (x2_hat[..., 0] + 1) / 2, h1 * (x2_hat[..., 1] + 1) / 2), dim=-1)
+    gd = (x2_hat - x2.reshape(b, h1, w1, 2)).norm(dim=-1)
+    gd = gd[prob == 1]
+    pck_1 = (gd < 1.0).float().mean()
+    pck_3 = (gd < 3.0).float().mean()
+    pck_5 = (gd < 5.0).float().mean()
+    return gd, pck_1, pck_3, pck_5
 
 
-def generate_visualization(model, batch, filename):
-    """Генерирует и сохраняет визуализацию для первого элемента в батче, выводит EPE в консоль."""
-    print(f"\n--- Создание визуализации: {filename} ---")
+def run_and_log_benchmark(model, batch, tb_writer, step, prefix=""):
+    """Runs benchmark logic on a single batch and logs results."""
+    print(f"\n--- Running validation for step {step} ---")
     model.eval()
+    planar_mode = True  # Hardcoded for this script
     with torch.no_grad():
-        model_output = model(batch, batched=True)
-        predictions = model_output[1]
-        
-        flow = predictions['flow']
-        certainty = predictions['certainty']
-        matches = get_matches_from_flow(flow)
+        matches, certainty = model.match(batch["im_A"], batch["im_B"], batched=True)
+        gd, pck_1, pck_3, pck_5 = geometric_dist(
+            matches,
+            batch["im_A_depth"],
+            batch["im_B_depth"],
+            batch["T_1to2"],
+            batch["K1"],
+            batch["K2"],
+            planar_mode,
+        )
 
-    # --- Расчет EPE для явного вывода ---
-    with torch.no_grad():
-        first_item_matches = matches[0]
-        h, w = first_item_matches.shape[:2]
-        x1_norm = first_item_matches[..., :2].reshape(1, h * w, 2)
-        mask_gt_fwd, x2_gt_norm = warp_kpts_planar(x1_norm, batch['T_1to2'][0].unsqueeze(0))
-        x2_pred_norm = first_item_matches[..., 2:].reshape(1, h * w, 2)
-        
-        x2_gt_px = torch.stack((w * (x2_gt_norm[0, :, 0] + 1) / 2, h * (x2_gt_norm[0, :, 1] + 1) / 2), dim=1)
-        x2_pred_px = torch.stack((w * (x2_pred_norm[0, :, 0] + 1) / 2, h * (x2_pred_norm[0, :, 1] + 1) / 2), dim=1)
-        
-        error_forward = (x2_pred_px - x2_gt_px).norm(dim=1)
-        valid_mask_fwd = mask_gt_fwd[0].bool()
-        valid_errors = error_forward[valid_mask_fwd]
-        mean_error = valid_errors.mean().item() if valid_errors.numel() > 0 else float("nan")
-        print(f"  [METRIC] Calculated Mean Error (EPE): {mean_error:.2f}px")
-    # --- Конец расчета EPE ---
+    results = {
+        "epe": gd.mean().item(),
+        "pck_1": pck_1.item(),
+        "pck_3": pck_3.item(),
+        "pck_5": pck_5.item(),
+    }
 
-    im_A = batch['im_A'][0]
-    im_B = batch['im_B'][0]
-    T_1to2 = batch['T_1to2'][0]
-    K1 = batch.get('K1', [None])[0]
-    K2 = batch.get('K2', [None])[0]
-    depth1 = batch.get('depth1', [None])[0]
-    depth2 = batch.get('depth2', [None])[0]
+    # Generate visualization
+    visual = [
+        visualize_total(
+            im_A=batch["im_A"][b],
+            im_B=batch["im_B"][b],
+            matches=matches[b],
+            certainty=certainty[b],
+            T_1to2=batch["T_1to2"][b],
+            K1=batch["K1"][b],
+            K2=batch["K2"][b],
+            depth1=batch["im_A_depth"][b],
+            depth2=batch["im_B_depth"][b],
+            planar_mode=planar_mode,
+        )[0]
+        for b in range(batch["im_A"].shape[0])
+    ]
+    results["visual"] = visual
 
-    fig = visualize_total(
-        im_A=im_A,
-        im_B=im_B,
-        matches=matches[0],
-        certainty=certainty[0].squeeze(),
-        T_1to2=T_1to2,
-        K1=K1,
-        K2=K2,
-        depth1=depth1,
-        depth2=depth2,
-        planar_mode=True,
-    )[0]
+    # Log to TensorBoard
+    log_benchmark_results(tb_writer, results, step, prefix)
+    model.train()  # Set model back to train mode
 
-    fig.savefig(filename, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Визуализация сохранена в: {filename}")
+
+class FixedBatchLoader:
+    """A dummy dataloader that always returns the same batch, infinitely."""
+
+    def __init__(self, batch):
+        self.batch = batch
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.batch
+
+
+def log_benchmark_results(tb_writer, results, step, prefix=""):
+    """Logs benchmark results to TensorBoard."""
+    if tb_writer is None:
+        return
+    print(f"Logging benchmark results to TensorBoard at step {step} with prefix '{prefix}'...")
+    for key, value in results.items():
+        if isinstance(value, (int, float)):
+            tb_writer.add_scalar(f"Benchmark/{prefix}{key}", scalar_value=value, global_step=step)
+    for i, fig in enumerate(results.get("visual", [])):
+        tb_writer.add_figure(f"Benchmark/{prefix}visual_{i}", figure=fig, global_step=step)
 
 
 def overfit_batch(args):
@@ -124,23 +139,27 @@ def overfit_batch(args):
     
     print(f"Используемое устройство: {device}")
 
+    # TensorBoard writer
+    tb_log_dir = f"workspace/overfit_logs_seed_{args.seed}"
+    os.makedirs(tb_log_dir, exist_ok=True)
+    tb_writer = SummaryWriter(tb_log_dir)
+    print(f"TensorBoard logging to: {tb_log_dir}")
+
     wandb.init(project="romatch_verification", mode="disabled")
 
     with open(train_data_path, "r") as f:
         scene_info = json.load(f)
     dataset = UmbraScene(scene_info, image_size=image_size, shake_t=16)
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
+
     fixed_batch_raw = next(iter(data_loader))
-    fixed_batch = {
-        k: v.to(device) if isinstance(v, torch.Tensor) else v 
-        for k, v in fixed_batch_raw.items()
-    }
-    
+    fixed_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in fixed_batch_raw.items()}
+
     print("Загрузка модели...")
     model = get_planar_model(pretrained_backbone=True, resolution="medium").to(device)
 
-    generate_visualization(model, fixed_batch, f"overfit_visualization_before_seed_{args.seed}.png")
+    # --- Валидация до обучения ---
+    run_and_log_benchmark(model, fixed_batch, tb_writer, 0, prefix="Before_")
 
     model.train()
 
@@ -152,49 +171,44 @@ def overfit_batch(args):
         local_dist={1: 8, 2: 12, 4: 16, 8: 20},
         planar_mode=True,
     )
-    
+
     parameters = [
-        {"params": model.encoder.parameters(), "lr": batch_size * 5e-6}, # Возвращено к исходному
-        {"params": model.decoder.parameters(), "lr": batch_size * 1e-4}, # Возвращено к исходному
+        {"params": model.encoder.parameters(), "lr": batch_size * 5e-6},  # Возвращено к исходному
+        {"params": model.decoder.parameters(), "lr": batch_size * 1e-4},  # Возвращено к исходному
     ]
-    optimizer = torch.optim.AdamW(parameters)
-    
-    losses = []
-    print(f"\n--- 4. Запуск цикла переобучения на {num_iterations} итераций ---")
-    
-    for i in range(num_iterations):
-        optimizer.zero_grad()
-        corresps = model(fixed_batch, batched=True)
-        loss = loss_fn(corresps, fixed_batch)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        losses.append(loss.item())
-        if (i + 1) % 20 == 0:
-            print(f"Итерация [{i+1}/{num_iterations}], Потери: {loss.item():.6f}")
+    optimizer = torch.optim.AdamW(parameters, weight_decay=0.01)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5, threshold=0.01, threshold_mode="rel"
+    )
+    grad_scaler = torch.amp.GradScaler("cuda", growth_interval=1_000_000)
+
+    print(f"\n--- Запуск цикла переобучения на {num_iterations} итераций ---")
+
+    # Вместо цикла используем train_k_steps
+    # Создаем data loader, который всегда возвращает один и тот же батч
+    fixed_dataloader = FixedBatchLoader(fixed_batch)
+
+    train_k_steps(
+        0,
+        num_iterations,
+        dataloader=fixed_dataloader,
+        model=model,
+        objective=loss_fn,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        grad_scaler=grad_scaler,
+        grad_clip_norm=0.01,
+        writer=tb_writer,
+    )
 
     print("\nПереобучение завершено.")
-    
-    plt.figure(figsize=(10, 5))
-    plt.plot(losses)
-    plt.xlabel("Итерация")
-    plt.ylabel("Потери")
-    plt.title(f"Переобучение на одном батче (Seed: {args.seed})")
-    plt.grid(True)
-    output_path = f"overfit_loss_seed_{args.seed}.png"
-    plt.savefig(output_path)
-    print(f"График потерь сохранен в: {output_path}")
 
-    generate_visualization(model, fixed_batch, f"overfit_visualization_after_seed_{args.seed}.png")
+    # --- Валидация после обучения ---
+    run_and_log_benchmark(model, fixed_batch, tb_writer, num_iterations, prefix="After_")
 
-    final_loss = losses[-1]
-    initial_loss = losses[0]
-    if final_loss < initial_loss * 0.1:
-        print(f"\nУСПЕХ: Потери значительно уменьшились с {initial_loss:.4f} до {final_loss:.4f}.")
-    else:
-        print(f"\nВНИМАНИЕ: Потери не уменьшились значительно. Начальные: {initial_loss:.4f}, Конечные: {final_loss:.4f}.")
-
+    # Проверку по значению потерь убираем, так как train_k_steps не возвращает историю потерь
     print("\n--- Тест на переобучение завершен ---")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

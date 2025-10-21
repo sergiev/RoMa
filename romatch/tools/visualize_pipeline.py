@@ -8,7 +8,7 @@ import torch
 
 from romatch.models.model_zoo import roma_model
 import matplotlib.pyplot as plt
-from romatch.utils import warp_kpts_planar, get_inverse_T
+from romatch.utils import warp_kpts_planar, get_inverse_T, warp_kpts, get_gt_warp
 import torch.nn.functional as F
 from matplotlib.colors import LinearSegmentedColormap, Normalize
 
@@ -60,8 +60,53 @@ def _get_cv2_affine_matrix(T_norm, h, w):
     M_cv2[1, 2] = (h / 2) * (-R[1, 0] - R[1, 1] + t[1]) + h / 2
     return M_cv2
 
+def visualize_matches(
+    ax, im_A_vis, im_B_vis, matches, certainty, valid_mask_fwd_np, h, w, cmap, error_map_forward_np, norm
+):
 
-def _draw_quadrant_center_correspondences(ax, im_A_np, im_B_np, T_1to2, T_2to1, h, w):
+    combined_np = np.concatenate(
+        [
+            (im_A_vis.permute(1, 2, 0).numpy() * 255).astype(np.uint8),
+            (im_B_vis.permute(1, 2, 0).numpy() * 255).astype(np.uint8),
+        ],
+        axis=1,
+    )
+    ax.imshow(combined_np)
+    ax.set_title("Matches colored by error (A -> B)", fontsize=12)
+    ax.axis("off")
+
+    certainty_np = certainty.detach().cpu().numpy()
+    goal_q = 200
+    n_points = np.prod(certainty_np.shape)
+    threshold = np.percentile(certainty_np, 100 - (goal_q + 1) / n_points * 100)
+    high_cert_mask = certainty_np > threshold
+
+    y_coords, x_coords = np.where(high_cert_mask & valid_mask_fwd_np)
+    print(len(y_coords))
+    if len(y_coords) > 0:
+        kpts0 = np.stack([x_coords, y_coords], axis=1)
+
+        matches_np = matches.detach().cpu().numpy()
+        kpts1_norm = matches_np[y_coords, x_coords, 2:]
+        kpts1 = np.stack([w * (kpts1_norm[:, 0] + 1) / 2, h * (kpts1_norm[:, 1] + 1) / 2], axis=1)
+
+        errors = error_map_forward_np[y_coords, x_coords]
+        errors_norm = norm(errors)
+        colors = cmap(errors_norm)
+
+        for i in range(len(kpts0)):
+            x1, y1 = kpts0[i]
+            x2, y2 = kpts1[i, 0] + w, kpts1[i, 1]
+
+            ax.plot([x1, x2], [y1, y2], color=colors[i], linewidth=1.5, alpha=0.6)
+
+        ax.scatter(kpts0[:, 0], kpts0[:, 1], c=colors, s=30, zorder=2, edgecolors="white", linewidths=0.5)
+        ax.scatter(kpts1[:, 0] + w, kpts1[:, 1], c=colors, s=30, zorder=2, edgecolors="white", linewidths=0.5)
+
+
+def _draw_quadrant_center_correspondences(
+    ax, im_A_np, im_B_np, T_1to2, T_2to1, h, w, planar_mode, depth1=None, depth2=None, K1=None, K2=None
+):
     """Draws lines for center and quadrant center correspondences between two images."""
     vis_img = np.concatenate((im_A_np, im_B_np), axis=1)
     ax.imshow(vis_img)
@@ -82,11 +127,30 @@ def _draw_quadrant_center_correspondences(ax, im_A_np, im_B_np, T_1to2, T_2to1, 
     color_A2B = "magenta"  # Фиолетовый
     color_B2A = "cyan"
 
-    # Project A -> B
-    _, points_A_in_B_norm = warp_kpts_planar(points_norm, T_1to2.unsqueeze(0))
-
-    # Project B -> A
-    _, points_B_in_A_norm = warp_kpts_planar(points_norm, T_2to1.unsqueeze(0))
+    if planar_mode:
+        # Project A -> B
+        _, points_A_in_B_norm = warp_kpts_planar(points_norm, T_1to2.unsqueeze(0))
+        # Project B -> A
+        _, points_B_in_A_norm = warp_kpts_planar(points_norm, T_2to1.unsqueeze(0))
+    else:
+        # Project A -> B
+        _, points_A_in_B_norm = warp_kpts(
+            points_norm,
+            depth1.unsqueeze(0),
+            depth2.unsqueeze(0),
+            T_1to2.unsqueeze(0),
+            K1.unsqueeze(0),
+            K2.unsqueeze(0),
+        )
+        # Project B -> A
+        _, points_B_in_A_norm = warp_kpts(
+            points_norm,
+            depth2.unsqueeze(0),
+            depth1.unsqueeze(0),
+            T_2to1.unsqueeze(0),
+            K2.unsqueeze(0),
+            K1.unsqueeze(0),
+        )
 
     for i in range(points_norm.shape[1]):
         # A -> B projection
@@ -165,48 +229,37 @@ def _get_pred_overlay(matches, certainty, valid_mask_np, im_A_np, im_B_np, h, w)
         return im_A_np.copy()
 
 
-def visualize_matches(
-    ax, im_A_vis, im_B_vis, matches, certainty, valid_mask_fwd_np, h, w, cmap, error_map_forward_np, norm
-):
+def _create_gt_overlay_3d(im_to_warp_np, im_ref_np, depth_to_warp, depth_ref, T_ref_to_warp, K_ref, K_to_warp, h, w):
+    """
+    Creates a GT overlay by warping one image onto another using 3D information.
+    Note: This uses an inverse warp (from reference to source) for cv2.remap.
+    """
+    with torch.no_grad():
+        # For each pixel in the reference image, find its corresponding coordinate in the "to_warp" image.
+        warp_norm, mask = get_gt_warp(
+            depth_ref.unsqueeze(0),
+            depth_to_warp.unsqueeze(0),
+            T_ref_to_warp.unsqueeze(0),
+            K_ref.unsqueeze(0),
+            K_to_warp.unsqueeze(0),
+        )
+    warp_norm = warp_norm.squeeze(0).cpu().numpy()
+    mask = mask.squeeze(0).cpu().numpy().astype(bool)
 
-    combined_np = np.concatenate(
-        [
-            (im_A_vis.permute(1, 2, 0).numpy() * 255).astype(np.uint8),
-            (im_B_vis.permute(1, 2, 0).numpy() * 255).astype(np.uint8),
-        ],
-        axis=1,
+    map_x = (w * (warp_norm[..., 0] + 1) / 2).astype(np.float32)
+    map_y = (h * (warp_norm[..., 1] + 1) / 2).astype(np.float32)
+
+    im_warped_np = cv2.remap(
+        im_to_warp_np,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
     )
-    ax.imshow(combined_np)
-    ax.set_title("Matches colored by error (A -> B)", fontsize=12)
-    ax.axis("off")
-
-    certainty_np = certainty.detach().cpu().numpy()
-    goal_q = 200
-    n_points = np.prod(certainty_np.shape)
-    threshold = np.percentile(certainty_np, 100 - (goal_q + 1) / n_points * 100)
-    high_cert_mask = certainty_np > threshold
-
-    y_coords, x_coords = np.where(high_cert_mask & valid_mask_fwd_np)
-    print(len(y_coords))
-    if len(y_coords) > 0:
-        kpts0 = np.stack([x_coords, y_coords], axis=1)
-
-        matches_np = matches.detach().cpu().numpy()
-        kpts1_norm = matches_np[y_coords, x_coords, 2:]
-        kpts1 = np.stack([w * (kpts1_norm[:, 0] + 1) / 2, h * (kpts1_norm[:, 1] + 1) / 2], axis=1)
-
-        errors = error_map_forward_np[y_coords, x_coords]
-        errors_norm = norm(errors)
-        colors = cmap(errors_norm)
-
-        for i in range(len(kpts0)):
-            x1, y1 = kpts0[i]
-            x2, y2 = kpts1[i, 0] + w, kpts1[i, 1]
-
-            ax.plot([x1, x2], [y1, y2], color=colors[i], linewidth=1.5, alpha=0.6)
-
-        ax.scatter(kpts0[:, 0], kpts0[:, 1], c=colors, s=30, zorder=2, edgecolors="white", linewidths=0.5)
-        ax.scatter(kpts1[:, 0] + w, kpts1[:, 1], c=colors, s=30, zorder=2, edgecolors="white", linewidths=0.5)
+    im_warped_np[~mask] = 0  # Apply mask
+    overlay = cv2.addWeighted(im_ref_np, 0.5, im_warped_np, 0.5, 0)
+    return overlay
 
 
 def visualize_total(
@@ -241,7 +294,16 @@ def visualize_total(
     if planar_mode:
         mask_gt_fwd, x2_gt_norm = warp_kpts_planar(x1_norm, T_1to2[None, ...])
     else:
-        raise NotImplementedError("3D visualization error calculation needs review.")
+        if depth1 is None or depth2 is None or K1 is None or K2 is None:
+            raise ValueError("Depth maps and camera intrinsics are required for non-planar mode.")
+        mask_gt_fwd, x2_gt_norm = warp_kpts(
+            x1_norm,
+            depth1.unsqueeze(0),
+            depth2.unsqueeze(0),
+            T_1to2.unsqueeze(0),
+            K1.unsqueeze(0),
+            K2.unsqueeze(0),
+        )
 
     x2_pred_norm = matches[..., 2:].reshape(1, h * w, 2)
 
@@ -254,7 +316,17 @@ def visualize_total(
     # --- Восстановление корректного расчета обратной ошибки (циклическая состоятельность) ---
     # 1. Берем предсказанные точки в B (x2_pred_norm)
     # 2. Проецируем их обратно в A, используя GT-трансформацию T_2to1
-    mask_gt_bwd, x1_cycled_gt_norm = warp_kpts_planar(x2_pred_norm, T_2to1[None, ...])
+    if planar_mode:
+        mask_gt_bwd, x1_cycled_gt_norm = warp_kpts_planar(x2_pred_norm, T_2to1[None, ...])
+    else:
+        mask_gt_bwd, x1_cycled_gt_norm = warp_kpts(
+            x2_pred_norm,
+            depth2.unsqueeze(0),
+            depth1.unsqueeze(0),
+            T_2to1.unsqueeze(0),
+            K2.unsqueeze(0),
+            K1.unsqueeze(0),
+        )
 
     # 3. Конвертируем исходные точки в A и "возвращенные" точки в пиксели
     x1_src_px = torch.stack((w * (x1_norm[0, :, 0] + 1) / 2, h * (x1_norm[0, :, 1] + 1) / 2), dim=1)
@@ -288,14 +360,22 @@ def visualize_total(
     norm = Normalize(vmin=0, vmax=15)
 
     # --- 2. ПОДГОТОВКА OVERLAY ИЗОБРАЖЕНИЙ ---
-    M_AtoB_cv2 = _get_cv2_affine_matrix(T_1to2, h, w)
-    M_BtoA_cv2 = _get_cv2_affine_matrix(T_2to1, h, w)
+    if planar_mode:
+        M_AtoB_cv2 = _get_cv2_affine_matrix(T_1to2, h, w)
+        M_BtoA_cv2 = _get_cv2_affine_matrix(T_2to1, h, w)
 
-    im_A_warped_to_B_np = cv2.warpAffine(im_A_np, M_AtoB_cv2, (w, h))
-    overlay_A_on_B = cv2.addWeighted(im_B_np, 0.5, im_A_warped_to_B_np, 0.5, 0)
+        im_A_warped_to_B_np = cv2.warpAffine(im_A_np, M_AtoB_cv2, (w, h))
+        overlay_A_on_B = cv2.addWeighted(im_B_np, 0.5, im_A_warped_to_B_np, 0.5, 0)
 
-    im_B_warped_to_A_np = cv2.warpAffine(im_B_np, M_BtoA_cv2, (w, h))
-    overlay_B_on_A = cv2.addWeighted(im_A_np, 0.5, im_B_warped_to_A_np, 0.5, 0)
+        im_B_warped_to_A_np = cv2.warpAffine(im_B_np, M_BtoA_cv2, (w, h))
+        overlay_B_on_A = cv2.addWeighted(im_A_np, 0.5, im_B_warped_to_A_np, 0.5, 0)
+    else:
+        # Для непланарного случая GT overlay создается через рендеринг с использованием обратного варпа
+        # A -> B (A warped onto B)
+        overlay_A_on_B = _create_gt_overlay_3d(im_A_np, im_B_np, depth1, depth2, T_2to1, K2, K1, h, w)
+
+        # B -> A (B warped onto A)
+        overlay_B_on_A = _create_gt_overlay_3d(im_B_np, im_A_np, depth2, depth1, T_1to2, K1, K2, h, w)
 
     # --- 2.5 PRED OVERLAY ---
     overlay_B_on_A_pred = _get_pred_overlay(matches, certainty, valid_mask_fwd_np, im_A_np, im_B_np, h, w)
@@ -359,7 +439,7 @@ Valid points: {valid_mask_fwd_np.sum()}/{valid_mask_fwd_np.size}"""
     # --- Размещение графиков в правой сетке ---
     # GT-квадранты
     ax_quad = fig_total.add_subplot(gs_right[0, :])
-    _draw_quadrant_center_correspondences(ax_quad, im_A_np, im_B_np, T_1to2, T_2to1, h, w)
+    _draw_quadrant_center_correspondences(ax_quad, im_A_np, im_B_np, T_1to2, T_2to1, h, w, planar_mode, depth1, depth2, K1, K2)
 
     # Предсказанные соответствия
     ax_matches = fig_total.add_subplot(gs_right[1, :])
