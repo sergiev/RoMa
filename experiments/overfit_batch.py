@@ -14,7 +14,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from romatch.datasets.umbra import UmbraScene
-from experiments.train_roma_umbra import get_planar_model
+from experiments.train_roma_umbra import get_planar_model, get_model
 from romatch.losses.robust_loss import RobustLosses
 from romatch.tools.visualize_pipeline import visualize_total
 from romatch.train.train import train_k_steps
@@ -50,11 +50,10 @@ def geometric_dist(dense_matches, depth1, depth2, T_1to2, K1, K2, planar_mode):
     return gd, pck_1, pck_3, pck_5
 
 
-def run_and_log_benchmark(model, batch, tb_writer, step, prefix=""):
+def run_and_log_benchmark(model, batch, tb_writer, step, planar_mode, prefix=""):
     """Runs benchmark logic on a single batch and logs results."""
     print(f"\n--- Running validation for step {step} ---")
     model.eval()
-    planar_mode = True  # Hardcoded for this script
     with torch.no_grad():
         matches, certainty = model.match(batch["im_A"], batch["im_B"], batched=True)
         gd, pck_1, pck_3, pck_5 = geometric_dist(
@@ -95,6 +94,7 @@ def run_and_log_benchmark(model, batch, tb_writer, step, prefix=""):
     # Log to TensorBoard
     log_benchmark_results(tb_writer, results, step, prefix)
     model.train()  # Set model back to train mode
+    return results
 
 
 class FixedBatchLoader:
@@ -128,19 +128,23 @@ def overfit_batch(args):
     """
     print("--- Запуск теста на переобучение на одном батче ---")
     print(f"--- Используется SEED: {args.seed} ---")
+    planar_mode = args.planar_mode
+    print(f"--- Planar mode: {planar_mode} ---")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     train_data_path = "/home/sema/radar/datasets/umbra_tiles/560/pairs_train.json"
     image_size = 560
-    batch_size = 2
+    batch_size = 8
     num_iterations = 200
+    scheduler_epochs = 50
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     print(f"Используемое устройство: {device}")
 
     # TensorBoard writer
-    tb_log_dir = f"workspace/overfit_logs_seed_{args.seed}"
+    tb_log_dir = f"workspace/overfit_seed_{args.seed}" + ("_planar" if planar_mode else "_fundamental")
+    
     os.makedirs(tb_log_dir, exist_ok=True)
     tb_writer = SummaryWriter(tb_log_dir)
     print(f"TensorBoard logging to: {tb_log_dir}")
@@ -156,10 +160,13 @@ def overfit_batch(args):
     fixed_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in fixed_batch_raw.items()}
 
     print("Загрузка модели...")
-    model = get_planar_model(pretrained_backbone=True, resolution="medium").to(device)
+    if planar_mode:
+        model = get_planar_model(pretrained_backbone=True, resolution="medium").to(device)
+    else:
+        model = get_model(pretrained_backbone=True, resolution="medium").to(device)
 
     # --- Валидация до обучения ---
-    run_and_log_benchmark(model, fixed_batch, tb_writer, 0, prefix="Before_")
+    run_and_log_benchmark(model, fixed_batch, tb_writer, 0, planar_mode, prefix="")
 
     model.train()
 
@@ -169,7 +176,7 @@ def overfit_batch(args):
     loss_fn = RobustLosses(
         ce_weight=0.0003,
         local_dist={1: 8, 2: 12, 4: 16, 8: 20},
-        planar_mode=True,
+        planar_mode=planar_mode,
     )
 
     parameters = [
@@ -187,31 +194,28 @@ def overfit_batch(args):
     # Вместо цикла используем train_k_steps
     # Создаем data loader, который всегда возвращает один и тот же батч
     fixed_dataloader = FixedBatchLoader(fixed_batch)
-
-    train_k_steps(
-        0,
-        num_iterations,
-        dataloader=fixed_dataloader,
-        model=model,
-        objective=loss_fn,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        grad_scaler=grad_scaler,
-        grad_clip_norm=0.01,
-        writer=tb_writer,
-    )
+    for epoch in range(scheduler_epochs):
+        train_k_steps(
+            0,
+            num_iterations,
+            dataloader=fixed_dataloader,
+            model=model,
+            objective=loss_fn,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            grad_scaler=grad_scaler,
+            grad_clip_norm=0.01,
+            writer=tb_writer,
+        )
+        results = run_and_log_benchmark(model, fixed_batch, tb_writer, num_iterations*(epoch+1), planar_mode, prefix="")
+        lr_scheduler.step(results["epe"])
 
     print("\nПереобучение завершено.")
-
-    # --- Валидация после обучения ---
-    run_and_log_benchmark(model, fixed_batch, tb_writer, num_iterations, prefix="After_")
-
-    # Проверку по значению потерь убираем, так как train_k_steps не возвращает историю потерь
-    print("\n--- Тест на переобучение завершен ---")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0, help="Random seed for data loading.")
+    parser.add_argument('--planar_mode', action='store_true', help='Use this flag to enable planar mode.')
     args = parser.parse_args()
     overfit_batch(args)

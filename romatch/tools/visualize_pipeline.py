@@ -82,7 +82,7 @@ def visualize_matches(
     high_cert_mask = certainty_np > threshold
 
     y_coords, x_coords = np.where(high_cert_mask & valid_mask_fwd_np)
-    print(len(y_coords))
+    print(len(y_coords), end="\t")
     if len(y_coords) > 0:
         kpts0 = np.stack([x_coords, y_coords], axis=1)
 

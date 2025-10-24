@@ -61,7 +61,7 @@ def train_k_steps(
         model.train(True)
         batch = to_cuda(batch)
 
-        if n == 0 and vis_callback is not None:
+        if n % k == 0 and vis_callback is not None:
             vis_callback(batch, romatch.GLOBAL_STEP)
             model.train(True)  # Re-set model to training mode
 

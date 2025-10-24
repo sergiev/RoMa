@@ -142,6 +142,8 @@ class UmbraDenseBenchmark:
             print(f"PCK@3px: {results['umbra_pck_3']:.3f}")
             print(f"PCK@5px: {results['umbra_pck_5']:.3f}")
             if self.vis_dir is not None:
+                for idx, fig in enumerate(results["visual"]):
+                    fig.savefig(os.path.join(self.vis_dir, f"bench_{idx:02d}.png"))
                 print(f"Visualizations saved to: {self.vis_dir}")
 
         return results

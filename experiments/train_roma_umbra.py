@@ -11,9 +11,9 @@ from argparse import ArgumentParser
 import json
 
 from torch import nn
-from torch.utils.data import ConcatDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import wandb
 from matplotlib import pyplot as plt
 from romatch.benchmarks.umbra_dense_benchmark import UmbraDenseBenchmark
@@ -401,36 +401,38 @@ def train(args):
         scene_name="umbra_train",
         use_horizontal_flip_aug=True,
         use_vertical_flip_aug=True,
-        shake_t=32,
+        shake_t=0,
     )
-    umbra_train = ConcatDataset([umbra_train_scene])
-
-    # Веса для сэмплирования (равномерные для одной сцены)
-    umbra_ws = torch.ones(len(umbra_train))
-
-    depth_loss = RobustLosses(
-        ce_weight=0.03,  # было 0.01 → +200% для certainty
-        local_dist={1:6, 2:6, 4:12, 8:12},  # было {1:4, 2:4, 4:8, 8:8} → {1:6, 2:6, 4:12, 8:12}
-        local_largest_scale=8,  # без изменений
-        alpha=0.5,  # без изменений
-        c=3e-4,  # было 1e-4 → +200% порог
-        scale_weights={
-            1: 1.5,
-            2: 1,
-            4: 0.7,
-            8: 0.5,
-            16: 0.2,
-        },  # новое (SAR имеет меньшую точность на грубых масштабах → уменьшить их вклад в loss)
+    
+    depth_loss =  RobustLosses(
+        ce_weight=0.0003,
+        local_dist={1: 8, 2: 12, 4: 16, 8: 20},
+        tb_writer=tb_writer,
         planar_mode=args.planar_mode,
     )
+    # RobustLosses(
+    #     ce_weight=0.03,  # было 0.01 → +200% для certainty
+    #     local_dist={1:6, 2:6, 4:12, 8:12},  # было {1:4, 2:4, 4:8, 8:8} → {1:6, 2:6, 4:12, 8:12}
+    #     local_largest_scale=8,  # без изменений
+    #     alpha=0.5,  # без изменений
+    #     c=3e-4,  # было 1e-4 → +200% порог
+    #     scale_weights={
+    #         1: 1.5,
+    #         2: 1,
+    #         4: 0.7,
+    #         8: 0.5,
+    #         16: 0.2,
+    #     },  # новое (SAR имеет меньшую точность на грубых масштабах → уменьшить их вклад в loss)
+    #     planar_mode=args.planar_mode,
+    # )
     parameters = [
         {"params": model.encoder.parameters(), "lr": romatch.STEP_SIZE * 5e-6},
         {"params": model.decoder.parameters(), "lr": romatch.STEP_SIZE * 1e-4},
     ]
 
-    optimizer = torch.optim.AdamW(parameters, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(parameters, weight_decay=0.0005)
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, threshold=0.01, threshold_mode="rel"
+        optimizer, mode="max", factor=0.75, patience=5, threshold=0.01, threshold_mode="rel", cooldown=5
     )
 
     # Бенчмарк для валидации (БЕЗ аугментаций!)
@@ -491,33 +493,34 @@ def train(args):
 
     grad_scaler = torch.amp.GradScaler("cuda", growth_interval=1_000_000)
     grad_clip_norm = 0.01
-    best_epe = 1e7  # less means better
+    best_optimetric = -1e7
+    epoch = 0
     # Цикл обучения
     for n in range(romatch.GLOBAL_STEP, N, k * romatch.STEP_SIZE):
-        umbra_sampler = torch.utils.data.WeightedRandomSampler(umbra_ws, num_samples=batch_size * k, replacement=True)
-        umbra_dataloader = iter(
-            torch.utils.data.DataLoader(
-                umbra_train,
-                batch_size=batch_size,
-                sampler=umbra_sampler,
-                num_workers=args.num_workers,
-            )
+        sampler = DistributedSampler(umbra_train_scene, shuffle=True)
+        sampler.set_epoch(epoch)
+        umbra_train_loader = torch.utils.data.DataLoader(
+            umbra_train_scene,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=args.num_workers,
         )
 
         train_k_steps(
             n,
             k,
-            umbra_dataloader,
+            iter(umbra_train_loader),
             ddp_model,
             depth_loss,
             optimizer,
             lr_scheduler,
             grad_scaler,
             grad_clip_norm=grad_clip_norm,
-            accumulation_steps=4,  # Эффективный батч-сайз 4*4=16
+            accumulation_steps=1,
             writer=tb_writer,
             vis_callback=tb_visualize_callback if rank == 0 else None,
         )
+        epoch += 1
 
         # Запуск бенчмарка и визуализаций
         if umbra_benchmark is not None and rank == 0:
@@ -534,10 +537,12 @@ def train(args):
                         tb_writer.add_scalar(f"Benchmark/{key}", scalar_value=value, global_step=romatch.GLOBAL_STEP)
                 for i, v in enumerate(benchmark_results["visual"]):
                     tb_writer.add_figure(f"Benchmark/visual_{i}", figure=v, global_step=romatch.GLOBAL_STEP)
-            lr_scheduler.step(benchmark_results["umbra_epe"])
-            if benchmark_results["umbra_epe"] < best_epe:
-                best_epe = benchmark_results["umbra_epe"]
+            optimetric = benchmark_results["umbra_pck_1"] * 100 + benchmark_results["umbra_pck_3"] * 30 + benchmark_results["umbra_pck_5"] * 10 - benchmark_results["umbra_epe"]
+            lr_scheduler.step(optimetric)
+            if optimetric > best_optimetric:
+                best_optimetric = optimetric
                 checkpointer.save(model, optimizer, lr_scheduler, romatch.GLOBAL_STEP, postfix="best")
+            print(f"Optimetric: {optimetric}, Best optimetric: {best_optimetric}")
 
         # Сохранение чекпоинта
         checkpointer.save(model, optimizer, lr_scheduler, romatch.GLOBAL_STEP, postfix="latest")
@@ -572,18 +577,14 @@ if __name__ == "__main__":
     parser.add_argument("--gpu_batch_size", default=4, type=int, help="Размер батча на одну GPU")
     parser.add_argument("--total_steps", default=50000, type=int, help="Общее количество шагов обучения")
     parser.add_argument("--checkpoint_every", default=5000, type=int, help="Частота сохранения чекпоинтов")
-    parser.add_argument("--val_samples", default=200, type=int, help="Количество пар для валидации")
-    parser.add_argument(
-        "--num_vis_samples", default=4, type=int, help="Количество фиксированных сэмплов для TensorBoard визуализаций"
-    )
-    parser.add_argument("--num_workers", default=4, type=int, help="Количество worker'ов для DataLoader")
+    parser.add_argument("--num_workers", default=8, type=int, help="Количество worker'ов для DataLoader")
     parser.add_argument("--wandb_entity", required=False, help="WandB entity")
     parser.add_argument("--flush", action="store_true", help="Не использовать global_step и состояние lr_scheduler")
     parser.add_argument(
-        "--use_planar_decoder", action="store_true", default=True, help="Использовать PlanarDecoder вместо стандартного"
+        "--use_planar_decoder", action="store_true", help="Использовать PlanarDecoder вместо стандартного"
     )
     parser.add_argument(
-        "--planar_mode", action="store_true", default=True, help="Использовать 2D геометрию для planar сцен (SAR)"
+        "--planar_mode", action="store_true", help="Использовать 2D геометрию для planar сцен (SAR)"
     )
 
     args, _ = parser.parse_known_args()
