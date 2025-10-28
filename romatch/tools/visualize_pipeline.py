@@ -262,6 +262,164 @@ def _create_gt_overlay_3d(im_to_warp_np, im_ref_np, depth_to_warp, depth_ref, T_
     return overlay
 
 
+def visualize_matching_no_gt(im_A, im_B, matches, certainty, n_matches=300, mean=None, std=None):
+    """Визуализация matching двух изображений без GT-данных
+    
+    Args:
+        im_A: torch.Tensor, shape (3, H, W) - первое изображение (нормализованное)
+        im_B: torch.Tensor, shape (3, H, W) - второе изображение (нормализованное)
+        matches: torch.Tensor, shape (H, W, 4) - dense matches [x1_norm, y1_norm, x2_norm, y2_norm]
+        certainty: torch.Tensor, shape (H, W) - карта уверенности
+        n_matches: int - количество отображаемых соответствий
+        mean: torch.Tensor, optional - mean для денормализации (по умолчанию UMBRA)
+        std: torch.Tensor, optional - std для денормализации (по умолчанию UMBRA)
+    
+    Returns:
+        np.ndarray: BGR изображение (H, W, 3), готовое для cv2.imwrite или отображения
+    """
+    h, w = matches.shape[:2]
+    device = im_A.device
+    
+    # Денормализация изображений
+    if mean is None:
+        mean = torch.tensor([0.221370, 0.221370, 0.221370], device=device).view(3, 1, 1)
+    if std is None:
+        std = torch.tensor([0.137669, 0.137669, 0.137669], device=device).view(3, 1, 1)
+    
+    im_A_vis = torch.clamp(im_A * std + mean, 0, 1).detach().cpu()
+    im_B_vis = torch.clamp(im_B * std + mean, 0, 1).detach().cpu()
+    
+    im_A_np = (im_A_vis.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    im_B_np = (im_B_vis.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    
+    # --- Подготовка данных для оверлеев и RANSAC ---
+    certainty_np = certainty.detach().cpu().numpy()
+    
+    # Выбираем точки с высокой уверенностью (например, топ 85%) для гомографии
+    threshold_h = np.percentile(certainty_np, 85)
+    y_coords_h, x_coords_h = np.where(certainty_np > threshold_h)
+    
+    im_B_warped_ransac = np.zeros_like(im_A_np)
+    inlier_count = 0
+    
+    if len(y_coords_h) >= 4:
+        kptsA_h_px = np.stack([x_coords_h, y_coords_h], axis=1).astype(np.float32)
+        matches_np_h = matches.detach().cpu().numpy()
+        kptsB_h_norm = matches_np_h[y_coords_h, x_coords_h, 2:]
+        kptsB_h_px = np.stack([w * (kptsB_h_norm[:, 0] + 1) / 2, h * (kptsB_h_norm[:, 1] + 1) / 2], axis=1).astype(np.float32)
+        
+        H_BtoA, inliers = cv2.findHomography(
+            kptsB_h_px, kptsA_h_px, cv2.USAC_MAGSAC, ransacReprojThreshold=8.0, confidence=0.999
+        )
+        if H_BtoA is not None:
+            im_B_warped_ransac = cv2.warpPerspective(im_B_np, H_BtoA, (w, h))
+            inlier_count = np.sum(inliers)
+
+    # --- Создание оверлеев ---
+    overlay_ransac = cv2.addWeighted(im_A_np, 0.5, im_B_warped_ransac, 0.5, 0)
+    
+    overlay_max = im_A_np.copy()
+    mask_warped = im_B_warped_ransac > 0
+    overlay_max[mask_warped] = np.maximum(im_A_np[mask_warped], im_B_warped_ransac[mask_warped])
+
+    # --- Визуализация ---
+    fig = plt.figure(figsize=(24, 12))
+    gs = fig.add_gridspec(2, 3, wspace=0.1, hspace=0.2)
+    
+    # 1. Image A
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(im_A_np)
+    ax1.set_title(f"Image A ({h}x{w})")
+    ax1.axis("off")
+    
+    # 2. Image B
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.imshow(im_B_np)
+    ax2.set_title(f"Image B ({h}x{w})")
+    ax2.axis("off")
+
+    # 3. RANSAC Overlay (addWeighted)
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.imshow(overlay_ransac)
+    ax3.set_title(f"RANSAC Blended Overlay ({inlier_count} inliers)")
+    ax3.axis("off")
+
+    # 4. Matches
+    ax4 = fig.add_subplot(gs[1, 0])
+    combined_np = np.concatenate([im_A_np, im_B_np], axis=1)
+    ax4.imshow(combined_np)
+    
+    # Выбор top-N точек по certainty для визуализации matches
+    n_points_total = np.prod(certainty_np.shape)
+    percentile = 100 - (min(n_matches, n_points_total) / n_points_total * 100) if n_points_total > 0 else 0
+    
+    if n_points_total > 0:
+        threshold_viz = np.percentile(certainty_np, percentile)
+        y_coords_viz, x_coords_viz = np.where(certainty_np >= threshold_viz)
+    else:
+        y_coords_viz, x_coords_viz = [], []
+
+    ax4.set_title(f"Matches by Certainty (top {len(y_coords_viz)} points)")
+    ax4.axis("off")
+    
+    scatter = None
+    if len(y_coords_viz) > 0:
+        indices = np.arange(len(y_coords_viz))
+        if len(y_coords_viz) > n_matches:
+            indices = np.random.choice(indices, n_matches, replace=False)
+        
+        y_coords_viz, x_coords_viz = y_coords_viz[indices], x_coords_viz[indices]
+        
+        kpts0 = np.stack([x_coords_viz, y_coords_viz], axis=1)
+        matches_np = matches.detach().cpu().numpy()
+        kpts1_norm = matches_np[y_coords_viz, x_coords_viz, 2:]
+        kpts1 = np.stack([w * (kpts1_norm[:, 0] + 1) / 2, h * (kpts1_norm[:, 1] + 1) / 2], axis=1)
+        
+        cert_values = certainty_np[y_coords_viz, x_coords_viz]
+        cmap = plt.cm.plasma
+        norm = Normalize(vmin=cert_values.min(), vmax=cert_values.max())
+        colors = cmap(norm(cert_values))
+        
+        for i in range(len(kpts0)):
+            x1, y1 = kpts0[i]
+            x2, y2 = kpts1[i, 0] + w, kpts1[i, 1]
+            ax4.plot([x1, x2], [y1, y2], color=colors[i], linewidth=0.8, alpha=0.5)
+        
+        scatter = ax4.scatter(kpts0[:, 0], kpts0[:, 1], c=cert_values, cmap=cmap, norm=norm, s=15, zorder=2, edgecolors="white", linewidths=0.5)
+        ax4.scatter(kpts1[:, 0] + w, kpts1[:, 1], c=cert_values, cmap=cmap, norm=norm, s=15, zorder=2, edgecolors="white", linewidths=0.5)
+
+    # 5. Max Overlay
+    ax5 = fig.add_subplot(gs[1, 1])
+    ax5.imshow(overlay_max)
+    ax5.set_title("RANSAC Maximum Overlay")
+    ax5.axis("off")
+
+    # 6. Пустой ax для colorbar
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.axis("off")
+    
+    if scatter:
+        cbar = fig.colorbar(scatter, ax=ax6, fraction=0.8, aspect=10)
+        cbar.set_label("Match Certainty")
+
+    # Конвертация matplotlib figure в numpy array
+    fig.canvas.draw()
+    
+    # Получаем RGBA буфер и конвертируем в numpy array
+    buf = fig.canvas.buffer_rgba()
+    img_array_rgba = np.asarray(buf)
+    
+    # Конвертируем RGBA -> RGB
+    img_array_rgb = cv2.cvtColor(img_array_rgba, cv2.COLOR_RGBA2RGB)
+
+    plt.close(fig)
+    
+    # Конвертация RGB -> BGR для OpenCV
+    img_bgr = cv2.cvtColor(img_array_rgb, cv2.COLOR_RGB2BGR)
+    
+    return img_bgr
+
+
 def visualize_total(
     im_A, im_B, matches, certainty, T_1to2, K1=None, K2=None, depth1=None, depth2=None, planar_mode=False
 ):

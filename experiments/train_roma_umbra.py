@@ -9,6 +9,7 @@ import sys
 import torch
 from argparse import ArgumentParser
 import json
+import warnings
 
 from torch import nn
 import torch.distributed as dist
@@ -402,35 +403,82 @@ def train(args):
         use_horizontal_flip_aug=True,
         use_vertical_flip_aug=True,
         shake_t=0,
+        planar_mode=args.planar_mode,
     )
     
-    depth_loss =  RobustLosses(
-        ce_weight=0.0003,
-        local_dist={1: 8, 2: 12, 4: 16, 8: 20},
+    # depth_loss =  RobustLosses( # params from overfit_b
+    #     ce_weight=0.0003,
+    #     local_dist={1: 8, 2: 12, 4: 16, 8: 20},
+    #     tb_writer=tb_writer,
+    #     planar_mode=args.planar_mode,
+    # )
+    depth_loss = RobustLosses(
+        ce_weight=0.03,
+        local_dist={1:6, 2:6, 4:12, 8:12},
+        local_largest_scale=8,
+        alpha=0.5,
+        c=3e-4,
+        scale_weights={
+            1: 0.25,
+            2: 1,
+            4: 0.75,
+            8: 0.5,
+            16: 0.25,
+        },
         tb_writer=tb_writer,
         planar_mode=args.planar_mode,
     )
-    # RobustLosses(
-    #     ce_weight=0.03,  # было 0.01 → +200% для certainty
-    #     local_dist={1:6, 2:6, 4:12, 8:12},  # было {1:4, 2:4, 4:8, 8:8} → {1:6, 2:6, 4:12, 8:12}
-    #     local_largest_scale=8,  # без изменений
-    #     alpha=0.5,  # без изменений
-    #     c=3e-4,  # было 1e-4 → +200% порог
-    #     scale_weights={
-    #         1: 1.5,
-    #         2: 1,
-    #         4: 0.7,
-    #         8: 0.5,
-    #         16: 0.2,
-    #     },  # новое (SAR имеет меньшую точность на грубых масштабах → уменьшить их вклад в loss)
-    #     planar_mode=args.planar_mode,
-    # )
-    parameters = [
-        {"params": model.encoder.parameters(), "lr": romatch.STEP_SIZE * 5e-6},
-        {"params": model.decoder.parameters(), "lr": romatch.STEP_SIZE * 1e-4},
-    ]
+    
+    # Learning rates для SAR ортофото (не наследуем от MegaDepth)
+    # Принципы:
+    # 1. Encoder pretrained на RGB → минимальная адаптация
+    # 2. SimplifiedGlobalMatcher (~0.5M params) → может быстрее
+    # 3. ConvRefiners с радиусами 11,7,4 (×2 параметров) → осторожнее
+    # 4. SAR low SNR → сильная регуляризация
+    if use_planar_decoder:
+        if rank == 0:
+            print("\n=== Learning rates для PlanarDecoder ===")
+            print(f"Encoder:        {romatch.STEP_SIZE * 1e-6:.2e} (медленная адаптация pretrained)")
+            print(f"Global matcher: {romatch.STEP_SIZE * 5e-4:.2e} (быстро, SimplifiedGlobalMatcher)")
+            print(f"Projections:    {romatch.STEP_SIZE * 2e-4:.2e} (средне)")
+            print(f"Refiners:       {romatch.STEP_SIZE * 1e-4:.2e} (осторожно, радиусы 11,7,4)")
+        
+        parameters = [
+            {
+                "params": model.encoder.parameters(),
+                "lr": romatch.STEP_SIZE * 1e-6,
+            },
+            {
+                "params": model.decoder.global_matcher.parameters(),
+                "lr": romatch.STEP_SIZE * 5e-4,
+            },
+            {
+                "params": model.decoder.proj.parameters(),
+                "lr": romatch.STEP_SIZE * 2e-4,
+            },
+            {
+                "params": model.decoder.conv_refiner.parameters(),
+                "lr": romatch.STEP_SIZE * 1e-4,
+            },
+        ]
+    else:
+        if rank == 0:
+            print("\n=== Learning rates для стандартного decoder ===")
+            print(f"Encoder: {romatch.STEP_SIZE * 1e-6:.2e}")
+            print(f"Decoder: {romatch.STEP_SIZE * 8e-5:.2e}")
+        
+        parameters = [
+            {
+                "params": model.encoder.parameters(),
+                "lr": romatch.STEP_SIZE * 1e-6,
+            },
+            {
+                "params": model.decoder.parameters(),
+                "lr": romatch.STEP_SIZE * 8e-5,
+            },
+        ]
 
-    optimizer = torch.optim.AdamW(parameters, weight_decay=0.0005)
+    optimizer = torch.optim.AdamW(parameters, weight_decay=0.01)  # Сильная регуляризация для SAR
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=0.75, patience=5, threshold=0.01, threshold_mode="rel", cooldown=5
     )

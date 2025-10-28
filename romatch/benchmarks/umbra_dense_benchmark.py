@@ -21,10 +21,16 @@ class UmbraDenseBenchmark:
             scene_info: словарь с ключами 'image_paths' и 'pairs'
             image_size: размер изображения для обработки
             vis_dir: директория для сохранения визуализаций
+            planar_mode: если True, использует planar warp, иначе depth-based warp
         """
         from romatch.datasets.umbra import UmbraScene
 
-        self.dataset = UmbraScene(scene_info, image_size=image_size, scene_name="umbra_val")
+        self.dataset = UmbraScene(
+            scene_info, 
+            image_size=image_size, 
+            scene_name="umbra_val",
+            planar_mode=planar_mode
+        )
         self.vis_dir = vis_dir
         self.planar_mode = planar_mode
         if self.vis_dir is not None:

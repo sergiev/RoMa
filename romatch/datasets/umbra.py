@@ -36,6 +36,7 @@ class UmbraScene(Dataset):
     def __init__(self, 
                  scene_info, 
                  image_size, 
+                 planar_mode,
                  scene_name="custom_scene",
                  use_horizontal_flip_aug=False,
                  use_vertical_flip_aug=False,
@@ -49,11 +50,14 @@ class UmbraScene(Dataset):
             use_horizontal_flip_aug: использовать horizontal flip (рекомендуется)
             use_vertical_flip_aug: использовать vertical flip (опционально для SAR)
             shake_t: максимальный сдвиг в пикселях для random translation
+            planar_mode: если True, создает упрощенную геометрию для planar warp,
+                        если False, создает полную 3D геометрию для depth-based warp
         """
         self.image_paths = scene_info["image_paths"]
         self.original_pairs = scene_info["pairs"]
         self.scene_name = scene_name
         self.image_size = image_size
+        self.planar_mode = planar_mode
         
         # Augmentation параметры
         self.use_horizontal_flip_aug = use_horizontal_flip_aug
@@ -183,53 +187,139 @@ class UmbraScene(Dataset):
     def homography_to_K_and_T(self, H, image_size):
         """
         Decomposes homography into K and T for RoMa compatibility.
-        For a planar scene, T_1to2 is derived from the homography H
-        that maps normalized coordinates from image 1 to image 2.
+        
+        H operates on normalized coordinates [-1, 1].
+        
+        Two modes:
+        - planar_mode=True: Simple identity K, 2D affine in T (for warp_kpts_planar)
+        - planar_mode=False: Proper K with focal length, 3D pose T (for warp_kpts)
         """
-        # For orthographic images, we use a simple K
-        K = np.eye(3, dtype=np.float32)
-        
-        # The transformation T should directly represent the homography effect
-        # on normalized coordinates.
-        T = np.eye(4, dtype=np.float32)
-        
-        # The 2x2 part of H is the rotation and scale component
-        T[0:2, 0:2] = H[0:2, 0:2]
-        
-        # The translation part of H
-        T[0, 3] = H[0, 2]
-        T[1, 3] = H[1, 2]
-        
-        return K, T
+        if self.planar_mode:
+            # PLANAR MODE: Simple geometry for warp_kpts_planar
+            # warp_kpts_planar uses only T[:2,:2] and T[:2,3] in normalized coords
+            K = np.eye(3, dtype=np.float32)
+            
+            T = np.eye(4, dtype=np.float32)
+            T[0:2, 0:2] = H[0:2, 0:2]  # 2D rotation/scale
+            T[0, 3] = H[0, 2]          # x translation
+            T[1, 3] = H[1, 2]          # y translation
+            
+            return K, T
+        else:
+            # NON-PLANAR MODE: Эмулируем planar warp через 3D геометрию
+            # Для warp_kpts нужно чтобы: K^-1 @ [x,y,1]*d → 3D → T → K @ → [x',y']
+            # давало тот же результат что H @ [x,y,1] в normalized coords
+            
+            # K: normalized [-1,1] → pixel [0, image_size]
+            # Используем focal_length = image_size/2, чтобы нормализованные координаты
+            # корректно мапились в 3D space
+            K = np.array([
+                [image_size / 2.0, 0, image_size / 2.0],
+                [0, image_size / 2.0, image_size / 2.0],
+                [0, 0, 1]
+            ], dtype=np.float32)
+            
+            # Для planar scene на глубине d=1:
+            # warp_kpts делает: x_3d = K^-1 @ [x,y,1] * d
+            #                   x'_3d = R @ x_3d + t
+            #                   [x',y'] = K @ x'_3d / x'_3d[2]
+            #
+            # Для ортофото: R должна быть in-plane rotation, t - in-plane translation
+            # При d=1 везде, глубина должна сохраняться: x'_3d[2] = 1
+            
+            # H работает на normalized coords, конвертируем в affine на [-1,1]:
+            # Извлекаем компоненты H (уже в normalized space)
+            a11, a12, tx = H[0, 0], H[0, 1], H[0, 2]
+            a21, a22, ty = H[1, 0], H[1, 1], H[1, 2]
+            
+            # Для сохранения planar геометрии: R - in-plane rotation
+            # t - in-plane translation scaled на depth
+            # При depth=1: x' = R @ x + t где x,x' в normalized space с depth
+            
+            # R: только in-plane (z-axis rotation)
+            R = np.array([
+                [a11, a12, 0],
+                [a21, a22, 0],
+                [0, 0, 1]
+            ], dtype=np.float32)
+            
+            # Translation: масштабируем на 1/focal_length чтобы учесть масштаб K
+            # tx, ty в normalized coords [-1,1], нужно в camera space при d=1
+            t = np.array([tx, ty, 0], dtype=np.float32)
+            
+            T = np.eye(4, dtype=np.float32)
+            T[:3, :3] = R
+            T[:3, 3] = t
+            
+            return K, T
 
     def horizontal_flip(self, im_A, im_B, K1, K2, T_1to2):
-        """Horizontal flip augmentation with correction for T_1to2"""
+        """Horizontal flip augmentation with correction for T_1to2 and K"""
         im_A = im_A.flip(-1)
         im_B = im_B.flip(-1)
         
-        # Adjust T_1to2 for horizontal flip
-        # x' = -x => in normalized coords, this flips the sign of x component
-        flip_mat = torch.tensor([[-1, 0], [0, 1]], dtype=T_1to2.dtype, device=T_1to2.device)
-        T_1to2[:2, :2] = flip_mat @ T_1to2[:2, :2] @ flip_mat
-        T_1to2[0, 3] = -T_1to2[0, 3] # Translation also flips
+        if self.planar_mode:
+            # PLANAR MODE: Work with normalized 2D coordinates
+            # x' = -x => flips sign of x component
+            flip_mat = torch.tensor([[-1, 0], [0, 1]], dtype=T_1to2.dtype, device=T_1to2.device)
+            T_1to2[:2, :2] = flip_mat @ T_1to2[:2, :2] @ flip_mat
+            T_1to2[0, 3] = -T_1to2[0, 3]
+        else:
+            # NON-PLANAR MODE: Work with 3D geometry
+            # Horizontal flip changes camera coordinate system
+            # Flip matrix for 3D: reflects across yz-plane
+            flip_3d = torch.tensor([
+                [-1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1]
+            ], dtype=T_1to2.dtype, device=T_1to2.device)
+            
+            # Transform: T'= flip @ T @ flip
+            T_1to2[:3, :3] = flip_3d @ T_1to2[:3, :3] @ flip_3d
+            T_1to2[:3, 3] = flip_3d @ T_1to2[:3, 3]
+            
+            # Adjust intrinsics: cx' = width - cx
+            K1_new = K1.clone()
+            K2_new = K2.clone()
+            K1_new[0, 2] = self.image_size - K1[0, 2]
+            K2_new[0, 2] = self.image_size - K2[0, 2]
+            K1, K2 = K1_new, K2_new
         
         return im_A, im_B, K1, K2, T_1to2
     
-    def vertical_flip(self, im_A, im_B, K1, K2):
+    def vertical_flip(self, im_A, im_B, K1, K2, T_1to2):
         """Vertical flip augmentation с корректировкой intrinsics"""
         im_A = im_A.flip(-2)
         im_B = im_B.flip(-2)
         
-        flip_mat = torch.tensor([
-            [1, 0, 0],
-            [0, -1, self.image_size],
-            [0, 0, 1.]
-        ], dtype=K1.dtype, device=K1.device)
+        if self.planar_mode:
+            # PLANAR MODE: Only adjust K (used minimally in planar mode)
+            flip_mat = torch.tensor([
+                [1, 0, 0],
+                [0, -1, self.image_size],
+                [0, 0, 1.]
+            ], dtype=K1.dtype, device=K1.device)
+            
+            K1 = flip_mat @ K1
+            K2 = flip_mat @ K2
+        else:
+            # NON-PLANAR MODE: Adjust both K and T
+            flip_3d = torch.tensor([
+                [1, 0, 0],
+                [0, -1, 0],
+                [0, 0, 1]
+            ], dtype=T_1to2.dtype, device=T_1to2.device)
+            
+            T_1to2[:3, :3] = flip_3d @ T_1to2[:3, :3] @ flip_3d
+            T_1to2[:3, 3] = flip_3d @ T_1to2[:3, 3]
+            
+            K1_new = K1.clone()
+            K2_new = K2.clone()
+            K1_new[1, 2] = self.image_size - K1[1, 2]
+            K2_new[1, 2] = self.image_size - K2[1, 2]
+            K1, K2 = K1_new, K2_new
         
-        K1 = flip_mat @ K1
-        K2 = flip_mat @ K2
-        
-        return im_A, im_B, K1, K2
+        return im_A, im_B, K1, K2, T_1to2
     
     def rand_shake(self, *things):
         """Random translation augmentation (применяется к тензорам ПОСЛЕ нормализации)"""
@@ -272,17 +362,30 @@ class UmbraScene(Dataset):
         if self.shake_t > 0:
             [im1, im2, depth1, depth2], t = self.rand_shake(im1, im2, depth1, depth2)
             
-            t_norm = t / self.image_size * 2
-            T_1to2[0, 3] -= t_norm[0]
-            T_1to2[1, 3] -= t_norm[1]
+            if self.planar_mode:
+                # PLANAR MODE: Work in normalized coordinates
+                t_norm = t / self.image_size * 2
+                T_1to2[0, 3] -= t_norm[0]
+                T_1to2[1, 3] -= t_norm[1]
+            else:
+                # NON-PLANAR MODE: Adjust translation in camera coordinates
+                # Translation in pixels needs to be converted to camera units
+                t_cam = t.astype(np.float32)  # pixels
+                T_1to2[0, 3] -= t_cam[0]
+                T_1to2[1, 3] -= t_cam[1]
 
-        # Horizontal flip
-        if self.use_horizontal_flip_aug and np.random.rand() > 0.5:
-            im1, im2, K1, K2, T_1to2 = self.horizontal_flip(im1, im2, K1, K2, T_1to2)
-        
-        # Vertical flip
-        if self.use_vertical_flip_aug and np.random.rand() > 0.5:
-            im1, im2, K1, K2 = self.vertical_flip(im1, im2, K1, K2)
+        # Augmentations (только для planar_mode=True, для False требуется доработка)
+        if self.planar_mode:
+            # Horizontal flip
+            if self.use_horizontal_flip_aug and np.random.rand() > 0.5:
+                im1, im2, K1, K2, T_1to2 = self.horizontal_flip(im1, im2, K1, K2, T_1to2)
+            
+            # Vertical flip
+            if self.use_vertical_flip_aug and np.random.rand() > 0.5:
+                im1, im2, K1, K2, T_1to2 = self.vertical_flip(im1, im2, K1, K2, T_1to2)
+        else:
+            # TODO: Корректные augmentations для 3D geometry
+            pass
 
         return {
             "im_A": im1,

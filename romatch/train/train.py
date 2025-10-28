@@ -21,6 +21,50 @@ def log_param_statistics(named_parameters, norm_type = 2):
     wandb.log({"grad_norm": total_grad_norm.item()}, step = romatch.GLOBAL_STEP)
     wandb.log({"param_norm": param_norm.item()}, step = romatch.GLOBAL_STEP)
 
+
+def log_encoder_decoder_grad_norms(model, writer=None, norm_type=2):
+    """
+    Вычисляет и логирует gradient norms отдельно для encoder и decoder.
+    Полезно для мониторинга соотношения learning rates.
+    """
+    if not hasattr(model, 'module'):
+        # Non-DDP model
+        encoder = model.encoder
+        decoder = model.decoder
+    else:
+        # DDP model - extract underlying model
+        encoder = model.module.encoder
+        decoder = model.module.decoder
+    
+    # Compute encoder grad norm
+    encoder_grads = [p.grad for p in encoder.parameters() if p.grad is not None]
+    if encoder_grads:
+        encoder_grad_norms = torch.stack([torch.norm(g.detach(), norm_type) for g in encoder_grads])
+        encoder_grad_norm = torch.norm(encoder_grad_norms, norm_type).item()
+    else:
+        encoder_grad_norm = 0.0
+    
+    # Compute decoder grad norm
+    decoder_grads = [p.grad for p in decoder.parameters() if p.grad is not None]
+    if decoder_grads:
+        decoder_grad_norms = torch.stack([torch.norm(g.detach(), norm_type) for g in decoder_grads])
+        decoder_grad_norm = torch.norm(decoder_grad_norms, norm_type).item()
+    else:
+        decoder_grad_norm = 0.0
+    
+    # Log to wandb
+    wandb.log({
+        "encoder_grad_norm": encoder_grad_norm,
+        "decoder_grad_norm": decoder_grad_norm,
+        "grad_norm_ratio": decoder_grad_norm / (encoder_grad_norm + 1e-8),
+    }, step=romatch.GLOBAL_STEP)
+    
+    # Log to TensorBoard
+    if isinstance(writer, SummaryWriter):
+        writer.add_scalar("GradNorms/encoder", encoder_grad_norm, global_step=romatch.GLOBAL_STEP)
+        writer.add_scalar("GradNorms/decoder", decoder_grad_norm, global_step=romatch.GLOBAL_STEP)
+        writer.add_scalar("GradNorms/ratio_decoder_to_encoder", decoder_grad_norm / (encoder_grad_norm + 1e-8), global_step=romatch.GLOBAL_STEP)
+
 def train_step(train_batch, model, objective, optimizer, grad_scaler, grad_clip_norm = 1.,**kwargs):
     optimizer.zero_grad()
     out = model(train_batch)
@@ -71,6 +115,10 @@ def train_k_steps(
 
         if (n + 1) % accumulation_steps == 0:
             grad_scaler.unscale_(optimizer)
+            
+            # Log gradient norms before clipping
+            log_encoder_decoder_grad_norms(model, writer=writer)
+            
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             grad_scaler.step(optimizer)
             grad_scaler.update()
